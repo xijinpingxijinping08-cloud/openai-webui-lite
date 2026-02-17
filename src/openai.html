@@ -1,0 +1,4376 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#605bec" />
+    <meta name="description" content="OpenAI Chat - 智能对话助手" />
+    <meta http-equiv="Content-Language" content="zh-CN" />
+    <title>OpenAI Chat</title>
+
+    <!-- Favicon -->
+    <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+
+    <!-- Web App Manifest -->
+    <link rel="manifest" href="site.webmanifest" />
+
+    <!-- iOS Safari -->
+    <link rel="apple-touch-icon" href="favicon.svg" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="OpenAI Chat" />
+
+    <script src="https://unpkg.com/tom-select@2.4.3/dist/js/tom-select.complete.min.js"></script>
+
+    <script src="https://unpkg.com/vue@3.5.22/dist/vue.global.prod.js"></script>
+    <script src="https://unpkg.com/sweetalert2@11.26.3/dist/sweetalert2.all.js"></script>
+    <script src="https://unpkg.com/marked@12.0.0/marked.min.js"></script>
+    <script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+    <link
+      href="https://unpkg.com/tom-select@2.4.3/dist/css/tom-select.default.css"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/github-markdown-css@5.8.1/github-markdown-light.css"
+    />
+    <!-- CSS: style.css -->
+    <link rel="stylesheet" href="style.css" />
+    <script>
+      var isWechat = new RegExp('wechat', 'i').test(window.navigator.userAgent);
+      if (isWechat && document.title) {
+        document.title = '✨ ' + document.title;
+      }
+      // IndexedDB 封装（支持WebDAV远程存储）
+      class OpenaiDB {
+        constructor() {
+          this.dbName = 'OpenaiChatDB';
+          this.version = 1;
+          this.storeName = 'chatData';
+          this.db = null;
+          // WebDAV 配置
+          this.webdavEnabled = false;
+          this.webdavConfig = {
+            url: '',
+            username: '',
+            password: '',
+            path: '/openai-chat/'
+          };
+        }
+
+        // 加载WebDAV配置（从IndexedDB）
+        async loadWebDAVConfig() {
+          if (!this.db) await this.init();
+          try {
+            var configStr = await this.getItem('openai_webdav_config');
+            if (configStr) {
+              var parsed = JSON.parse(configStr);
+              this.webdavEnabled = parsed.enabled || false;
+              this.webdavConfig = parsed.config || this.webdavConfig;
+            }
+          } catch (e) {
+            console.error('解析WebDAV配置失败:', e);
+          }
+        }
+
+        // 保存WebDAV配置（到IndexedDB）
+        async saveWebDAVConfig(enabled, config) {
+          this.webdavEnabled = enabled;
+          this.webdavConfig = config;
+          // 直接写入IndexedDB，不走setItem（避免触发WebDAV同步）
+          if (!this.db) await this.init();
+          return new Promise((resolve, reject) => {
+            var transaction = this.db.transaction(
+              [this.storeName],
+              'readwrite'
+            );
+            var store = transaction.objectStore(this.storeName);
+            var request = store.put({
+              key: 'openai_webdav_config',
+              value: JSON.stringify({ enabled: enabled, config: config })
+            });
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => resolve();
+          });
+        }
+
+        // 构建WebDAV代理URL
+        _buildProxyUrl(targetPath) {
+          // 通过 /webdav 代理接口转发请求
+          return '/webdav' + targetPath;
+        }
+
+        // 构建WebDAV代理请求头
+        _buildProxyHeaders(config, extraHeaders = {}) {
+          var baseUrl = config.url.replace(/\/$/, '');
+          var headers = {
+            'X-WebDAV-URL': baseUrl,
+            'X-WebDAV-Auth':
+              'Basic ' + btoa(config.username + ':' + config.password)
+          };
+          return Object.assign(headers, extraHeaders);
+        }
+
+        // 测试WebDAV连接（使用 PUT/GET/DELETE 方式，兼容性更好）
+        async testWebDAVConnection(config) {
+          var testFileName = '.webdav-test-' + Date.now() + '.txt';
+          var testContent = 'test-' + Date.now();
+          var regexp = new RegExp('\/$');
+          var targetPath = config.path.replace(regexp, '') + '/' + testFileName;
+          var proxyUrl = this._buildProxyUrl(targetPath);
+          var headers = this._buildProxyHeaders(config, {
+            'Content-Type': 'text/plain'
+          });
+
+          try {
+            // 步骤1: 尝试写入测试文件
+            var putResponse = await fetch(proxyUrl, {
+              method: 'PUT',
+              headers: headers,
+              body: testContent
+            });
+
+            // 401 表示认证失败
+            if (putResponse.status === 401) {
+              return { success: false, error: '认证失败，请检查用户名和密码' };
+            }
+
+            // 403 表示没有写入权限
+            if (putResponse.status === 403) {
+              return { success: false, error: '没有写入权限' };
+            }
+
+            // PUT 成功的状态码: 200, 201, 204
+            if (![200, 201, 204].includes(putResponse.status)) {
+              return {
+                success: false,
+                error:
+                  '写入测试失败，请检查目录是否已创建: HTTP ' +
+                  putResponse.status
+              };
+            }
+
+            // 步骤2: 尝试读取测试文件
+            var getHeaders = this._buildProxyHeaders(config);
+            var getResponse = await fetch(proxyUrl, {
+              method: 'GET',
+              headers: getHeaders
+            });
+
+            if (getResponse.status !== 200) {
+              return {
+                success: false,
+                error: '读取测试失败: HTTP ' + getResponse.status
+              };
+            }
+
+            var readContent = await getResponse.text();
+            if (readContent !== testContent) {
+              return { success: false, error: '数据验证失败' };
+            }
+
+            // 步骤3: 删除测试文件（清理）
+            var deleteHeaders = this._buildProxyHeaders(config);
+            await fetch(proxyUrl, {
+              method: 'DELETE',
+              headers: deleteHeaders
+            });
+            // 删除失败也不影响测试结果，忽略错误
+
+            return { success: true };
+          } catch (e) {
+            return { success: false, error: e.message || '网络错误' };
+          }
+        }
+
+        // WebDAV 读取文件
+        async webdavGet(filename) {
+          var targetPath = this.webdavConfig.path + filename;
+          var proxyUrl = this._buildProxyUrl(targetPath);
+          var headers = this._buildProxyHeaders(this.webdavConfig);
+          try {
+            var response = await fetch(proxyUrl, {
+              method: 'GET',
+              headers: headers
+            });
+            if (response.status === 200) {
+              return await response.text();
+            } else if (response.status === 404) {
+              return null;
+            } else {
+              console.error('WebDAV GET 失败:', response.status);
+              return null;
+            }
+          } catch (e) {
+            console.error('WebDAV GET 错误:', e);
+            return null;
+          }
+        }
+
+        // WebDAV 写入文件
+        async webdavPut(filename, content) {
+          var targetPath = this.webdavConfig.path + filename;
+          var proxyUrl = this._buildProxyUrl(targetPath);
+          var headers = this._buildProxyHeaders(this.webdavConfig, {
+            'Content-Type': 'application/json'
+          });
+          try {
+            var response = await fetch(proxyUrl, {
+              method: 'PUT',
+              headers: headers,
+              body: content
+            });
+            return (
+              response.status === 200 ||
+              response.status === 201 ||
+              response.status === 204
+            );
+          } catch (e) {
+            console.error('WebDAV PUT 错误:', e);
+            return false;
+          }
+        }
+
+        // WebDAV 防抖同步（减少频繁写入）
+        _debouncedWebdavSync(value) {
+          this._pendingWebdavData = value;
+          if (this._webdavSyncTimer) {
+            clearTimeout(this._webdavSyncTimer);
+          }
+          this._webdavSyncTimer = setTimeout(async () => {
+            if (this._pendingWebdavData) {
+              console.log('[WebDAV] 同步数据到远程...');
+              var success = await this.webdavPut(
+                'sessions.json',
+                this._pendingWebdavData
+              );
+              if (!success) {
+                console.error('[WebDAV] 同步失败');
+              } else {
+                console.log('[WebDAV] 同步成功');
+              }
+              this._pendingWebdavData = null;
+            }
+            this._webdavSyncTimer = null;
+          }, 5000); // 5秒防抖
+        }
+
+        // 立即同步到 WebDAV（用于页面关闭前等场景）
+        async flushWebdavSync() {
+          if (this._webdavSyncTimer) {
+            clearTimeout(this._webdavSyncTimer);
+            this._webdavSyncTimer = null;
+          }
+          if (this._pendingWebdavData && this.webdavEnabled) {
+            console.log('[WebDAV] 立即同步数据...');
+            await this.webdavPut('sessions.json', this._pendingWebdavData);
+            this._pendingWebdavData = null;
+          }
+        }
+
+        async init() {
+          return new Promise((resolve, reject) => {
+            const request = indexedDB.open(this.dbName, this.version);
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+              this.db = request.result;
+              resolve(this.db);
+            };
+
+            request.onupgradeneeded = event => {
+              const db = event.target.result;
+              if (!db.objectStoreNames.contains(this.storeName)) {
+                db.createObjectStore(this.storeName, { keyPath: 'key' });
+              }
+            };
+          });
+        }
+
+        async setItem(key, value) {
+          // 先写入本地 IndexedDB（保证数据安全）
+          if (!this.db) await this.init();
+
+          await new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(
+              [this.storeName],
+              'readwrite'
+            );
+            const store = transaction.objectStore(this.storeName);
+            const request = store.put({ key, value });
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => resolve();
+          });
+
+          // 如果是sessions且启用了WebDAV，则使用防抖同步到远程
+          if (key === 'openai_sessions' && this.webdavEnabled) {
+            this._debouncedWebdavSync(value);
+          }
+        }
+
+        async getItem(key) {
+          // 如果是sessions且启用了WebDAV，则从远程读取
+          if (key === 'openai_sessions' && this.webdavEnabled) {
+            // 设置加载状态
+            if (window.app) window.app.isLoadingRemoteSessions = true;
+            try {
+              // 120秒内的缓存有效
+              const timestamp = Math.floor(Date.now() / 1000 / 120);
+              var remoteData = await this.webdavGet(
+                'sessions.json?v=' + timestamp
+              );
+              if (remoteData !== null) {
+                if (window.app) {
+                  window.app.showToast('远程数据已加载', 'success');
+                }
+                return remoteData;
+              }
+              // 如果远程没有数据，回退到本地
+              console.log('WebDAV无数据，尝试从本地读取');
+            } finally {
+              if (window.app) window.app.isLoadingRemoteSessions = false;
+            }
+          }
+
+          if (!this.db) await this.init();
+
+          return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(
+              [this.storeName],
+              'readonly'
+            );
+            const store = transaction.objectStore(this.storeName);
+            const request = store.get(key);
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+              const result = request.result;
+              resolve(result ? result.value : null);
+            };
+          });
+        }
+
+        // 计算IndexedDB存储空间大小（MB）
+        async getTotalDataSize() {
+          if (!this.db) await this.init();
+
+          return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(
+              [this.storeName],
+              'readonly'
+            );
+            const store = transaction.objectStore(this.storeName);
+            const request = store.getAll();
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+              const allData = request.result;
+              let totalSize = 0;
+
+              // 计算所有数据的JSON字符串大小
+              allData.forEach(item => {
+                const jsonString = JSON.stringify(item);
+                // 使用UTF-8编码计算字节数
+                totalSize += new Blob([jsonString]).size;
+              });
+
+              // 转换为MB
+              const sizeInMB = totalSize / (1024 * 1024);
+              resolve(sizeInMB);
+            };
+          });
+        }
+
+        // 获取存储空间统计信息
+        async getStorageStats() {
+          if (!this.db) await this.init();
+
+          const stats = {
+            totalSizeMB: 0,
+            itemCount: 0,
+            largestItemKey: '',
+            largestItemSizeMB: 0
+          };
+
+          return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(
+              [this.storeName],
+              'readonly'
+            );
+            const store = transaction.objectStore(this.storeName);
+            const request = store.getAll();
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+              const allData = request.result;
+              let totalSize = 0;
+              let maxSize = 0;
+              let maxKey = '';
+
+              allData.forEach(item => {
+                const jsonString = JSON.stringify(item);
+                const itemSize = new Blob([jsonString]).size;
+                totalSize += itemSize;
+
+                if (itemSize > maxSize) {
+                  maxSize = itemSize;
+                  maxKey = item.key || 'unknown';
+                }
+              });
+
+              stats.totalSizeMB = totalSize / (1024 * 1024);
+              stats.itemCount = allData.length;
+              stats.largestItemKey = maxKey;
+              stats.largestItemSizeMB = maxSize / (1024 * 1024);
+
+              resolve(stats);
+            };
+          });
+        }
+      }
+
+      // 全局实例
+      window.openaiDB = new OpenaiDB();
+    </script>
+  </head>
+
+  <body>
+    <div id="app">
+      <!-- 移动端菜单按钮 -->
+      <button
+        v-cloak
+        v-show="isMobile"
+        class="mobile-menu-btn"
+        style="display: none"
+        @click="toggleSidebar"
+      >
+        {{ !showSidebar ? '☰' : '＜' }}
+      </button>
+      <!-- 移动端遮罩层 -->
+      <div
+        class="sidebar-overlay"
+        :class="{ show: showSidebar && isMobile }"
+        v-cloak
+        @click="hideSidebar"
+      ></div>
+      <div class="container" :class="{ wide: isWideMode }">
+        <!-- 侧边栏 -->
+        <div
+          v-show="true"
+          class="sidebar"
+          :class="{ show: showSidebar || !isMobile, mobile: isMobile }"
+          v-cloak
+          style="display: none"
+        >
+          <!-- 设置按钮 -->
+          <div class="settings-section">
+            <button
+              class="settings-btn"
+              :class="{ mobile: isMobile }"
+              @click="openSettingsModal()"
+            >
+              ⚙️ 设置
+              <span v-if="!apiKey" style="color: #e74c3c; margin-left: 4px"
+                >(未配置)</span
+              >
+              <span
+                v-else-if="storageMode === 'webdav'"
+                style="color: #5fbdbd; margin-left: 4px"
+                >(远程存储)</span
+              >
+            </button>
+          </div>
+          <!-- 角色设定 -->
+          <div v-show="!isLoadingRemoteSessions" class="role-setting">
+            <label
+              for="rolePrompt"
+              style="
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 8px;
+                font-weight: 500;
+              "
+            >
+              <span>
+                <span>角色设定&nbsp;</span>
+                <span v-if="!globalRolePromptEnabled">(已禁用):</span>
+                <span v-else-if="!globalRolePrompt">(可选):</span>
+                <span v-else="">(已启用):</span>
+              </span>
+              <span>
+                <button
+                  class="reset-btn"
+                  style="
+                    width: 0;
+                    padding-left: 0;
+                    padding-right: 0;
+                    margin-left: 0;
+                    visibility: hidden;
+                    pointer-events: none;
+                  "
+                >
+                  　
+                </button>
+                <button
+                  v-if="globalRolePrompt && globalRolePromptEnabled"
+                  class="reset-btn"
+                  @click="clearRolePrompt"
+                  title="清空角色设定"
+                >
+                  清空
+                </button>
+                <button
+                  v-if="globalRolePrompt"
+                  class="reset-btn"
+                  :title="globalRolePromptEnabled ? '禁用角色设定' : '启用角色设定'"
+                  @click="toggleRolePrompt()"
+                >
+                  {{ globalRolePromptEnabled ? '禁用' : '启用' }}
+                </button>
+              </span>
+            </label>
+            <textarea
+              id="rolePrompt"
+              v-model="globalRolePrompt"
+              class="role-textarea"
+              :disabled="!globalRolePromptEnabled && globalRolePrompt.length > 0"
+              placeholder="输入系统提示词或角色设定..."
+              @input="updateGlobalRolePrompt"
+            >
+            </textarea>
+          </div>
+          <!-- 新建会话按钮 -->
+          <button
+            v-show="!isLoadingRemoteSessions"
+            @click="createNewSession"
+            class="new-session-btn"
+          >
+            ➕ 新建会话
+          </button>
+          <!-- 会话列表 -->
+          <div class="sessions">
+            <!-- 远程加载中的提示 -->
+            <div
+              v-if="isLoadingRemoteSessions"
+              class="loading-remote-sessions"
+              style="margin-top: calc(50vh - 70px - 104px)"
+            >
+              <span class="loading-spinner"></span>
+              <span>正在加载远程数据...</span>
+            </div>
+            <div
+              v-for="session in sessions"
+              v-show="!isLoadingRemoteSessions"
+              :key="session.id"
+              @click="switchSession(session.id)"
+              :class="['session-item', { active: currentSessionId === session.id }]"
+              :title="session.summary || session.title || '新会话'"
+            >
+              <div class="session-title">
+                <span>{{ session.summary || session.title || '新会话' }}</span>
+                <span v-if="session.role">&nbsp;💭</span>
+              </div>
+              <button
+                @click.stop="deleteSession(session.id)"
+                class="delete-btn"
+                title="删除会话"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        </div>
+        <!-- 主聊天区域 -->
+        <div class="main-chat" v-show="true" v-cloak style="display: none">
+          <!-- 头部 -->
+          <div class="header">
+            <h2 style="cursor: pointer">
+              <div class="brand" @click="showAbout">
+                <img
+                  src="./favicon.svg"
+                  alt=""
+                  width="24"
+                  height="24"
+                  style="flex: 0 0 auto; line-height: 1"
+                />
+                <span>OpenAI Chat</span>
+              </div>
+            </h2>
+            <div class="model-wrap">
+              <select
+                v-model="selectedModel"
+                class="model-select"
+                :class="{simple: availableModels.length <= 10}"
+                id="selectedModel"
+                :disabled="isLoading || isStreaming"
+                @change="saveData()"
+              >
+                <option v-if="false">　</option>
+                <option
+                  v-for="i in availableModels"
+                  :key="i.value"
+                  :value="i.value"
+                >
+                  {{ i.label }}
+                </option>
+              </select>
+              <label for="needSearch" class="model-search-label">
+                <input
+                  type="checkbox"
+                  v-model="needSearch"
+                  class="model-search"
+                  id="needSearch"
+                  @change="saveData()"
+                />
+                <span>联网搜索</span>
+              </label>
+            </div>
+            <div class="tool-btns">
+              <button
+                v-if="isPC"
+                class="tool-btn wide-btn"
+                @click="toggleWideMode"
+              >
+                {{ isWideMode ? '&nbsp;› 收窄 ‹&nbsp;' : '&nbsp;‹ 加宽 ›&nbsp;'
+                }}
+              </button>
+              <button
+                v-if="currentSession && currentSession.messages && currentSession.messages.length > 1 && !isLoading && !isStreaming"
+                class="tool-btn share-btn"
+                @click="shareSession"
+              >
+                📸 分享
+              </button>
+            </div>
+          </div>
+          <!-- 消息区域 -->
+          <div class="messages-container" ref="messagesContainer">
+            <div
+              v-if="!currentSession || !currentSession.messages || currentSession.messages.length === 0"
+              class="empty-state"
+            >
+              <div
+                v-if="isLoadingRemoteSessions"
+                class="loading-remote-sessions"
+              >
+                <span class="loading-spinner"></span>
+                <span>正在加载远程数据...</span>
+              </div>
+              <template v-if="!isLoadingRemoteSessions">
+                <h3>开始与 AI 对话</h3>
+                <p>选择一个模型并输入您的问题</p>
+              </template>
+            </div>
+            <div
+              v-if="currentSession && currentSession.messages && currentSession.messages.length > 0"
+              class="session-content"
+              :class="{capturing: isCapturing}"
+            >
+              <!-- 角色设定显示 -->
+              <div
+                v-if="currentSession.role && currentSession.role.trim()"
+                class="content-section role-section"
+              >
+                <h4>
+                  <span>
+                    <label for="fold">
+                      <span>角色设定　</span>
+                      <input
+                        v-show="!isCapturing"
+                        v-model="isFoldRole"
+                        type="checkbox"
+                        id="fold"
+                      />
+                      <small v-show="!isCapturing">&nbsp;折叠</small>
+                    </label>
+                  </span>
+                  <button
+                    @click="copyToClipboard(currentSession.role)"
+                    class="copy-btn"
+                    title="复制角色设定"
+                  >
+                    复制
+                  </button>
+                </h4>
+                <div
+                  class="rendered-content markdown-body"
+                  v-html="renderMarkdown(currentSession.role)"
+                ></div>
+              </div>
+              <!-- 使用v-for渲染消息列表 -->
+              <template
+                v-for="(msg, msgIndex) in currentSession.messages"
+                :key="msgIndex"
+              >
+                <!-- 用户消息 -->
+                <div
+                  v-if="msg.type === 'user'"
+                  class="content-section question-section"
+                >
+                  <h4>
+                    <span>
+                      <span>{{ getMsgLabel(msg, msgIndex) }}</span>
+                      <small v-if="msg.time"
+                        >&emsp;{{ formatTimeStr(msg.time) }}</small
+                      >
+                    </span>
+                    <div>
+                      <button
+                        v-if="canEditMessage(msgIndex)"
+                        class="copy-btn"
+                        title="编辑问题"
+                        @click="editQuestion(msgIndex)"
+                      >
+                        编辑
+                      </button>
+                      <button
+                        @click="copyToClipboard(msg.content)"
+                        class="copy-btn"
+                        title="复制问题"
+                      >
+                        复制
+                      </button>
+                    </div>
+                  </h4>
+                  <div
+                    class="rendered-content markdown-body"
+                    v-html="renderMarkdown(msg.content)"
+                  ></div>
+                  <!-- 图片链接 -->
+                  <div
+                    v-if="msg.images && msg.images.length > 0"
+                    class="question-images"
+                  >
+                    <a
+                      v-for="(img, imgIdx) in msg.images"
+                      :key="imgIdx"
+                      href="javascript:void(0)"
+                      :title="img === 'INVALID' ? '图片未上传,无法预览' : '点击预览'"
+                      :style="img === 'INVALID' ? 'cursor: not-allowed; opacity: 0.5;' : ''"
+                      @click="previewImage(img)"
+                    >
+                      📎 {{ img === 'INVALID' ? '本地' : '' }}图片{{ imgIdx + 1
+                      }}
+                    </a>
+                  </div>
+                  <!-- 文本附件链接 -->
+                  <div
+                    v-if="msg.plaintexts && msg.plaintexts.length > 0"
+                    class="question-images"
+                  >
+                    <a
+                      v-for="(txt, txtIdx) in msg.plaintexts"
+                      :key="'txt-' + txtIdx"
+                      href="javascript:void(0)"
+                      title="点击预览内容"
+                      @click="previewPlaintext(txt)"
+                    >
+                      📄 {{ txt.name }}
+                    </a>
+                  </div>
+                </div>
+                <!-- AI回答 -->
+                <div
+                  v-if="msg.type === 'bot'"
+                  class="content-section answer-section"
+                >
+                  <h4>
+                    <span>
+                      <span>回答</span>
+                      <small v-if="msg.model"
+                        >&emsp;{{ getModelName(msg.model) }}</small
+                      >
+                    </span>
+                    <div v-if="!isStreaming || !isLastBotMsg(msgIndex)">
+                      <button
+                        v-if="canRegenerateMessage(msgIndex)"
+                        class="copy-btn"
+                        title="删除并重新回答"
+                        @click="regenerateAnswer(msgIndex)"
+                      >
+                        重新回答
+                      </button>
+                      <button
+                        v-if="canForkMessage(msgIndex)"
+                        class="copy-btn"
+                        title="从此处分叉创建新会话"
+                        @click="forkFromMessage(msgIndex)"
+                      >
+                        分叉
+                      </button>
+                      <button
+                        class="copy-btn"
+                        title="复制回答"
+                        @click="copyToClipboard(msg.content)"
+                      >
+                        复制
+                      </button>
+                    </div>
+                  </h4>
+                  <div
+                    class="rendered-content markdown-body streaming-answer"
+                    v-html="renderMarkdown(getBotMessageContent(msg, msgIndex))"
+                    @click="answerClickHandler"
+                  ></div>
+                </div>
+              </template>
+              <!-- 流式回答占位（当最后一条是用户消息且正在生成回复时） -->
+              <div
+                v-if="isStreamingNewAnswer"
+                class="content-section answer-section"
+              >
+                <h4>
+                  <span>
+                    <span>回答</span>
+                    <small>&emsp;{{ getModelName(selectedModel) }}</small>
+                  </span>
+                </h4>
+                <div
+                  class="rendered-content markdown-body streaming-answer"
+                  v-html="renderMarkdown(streamingContent)"
+                  @click="answerClickHandler"
+                ></div>
+              </div>
+            </div>
+            <div v-if="shouldShowLoading" class="loading">
+              <div class="spinner"></div>
+              <span>AI 正在思考中...</span>
+            </div>
+
+            <div v-if="errorMessage" class="error-message">
+              {{ errorMessage }}
+            </div>
+
+            <!-- 重新回答按钮 -->
+            <div
+              v-if="shouldShowRetryButton"
+              style="text-align: center; margin: 0 0 20px"
+            >
+              <button
+                @click="retryCurrentQuestion"
+                class="send-btn"
+                style="margin: 0 auto"
+              >
+                ↺ 重新回答
+              </button>
+            </div>
+          </div>
+          <!-- 输入区域 -->
+          <div class="input-area">
+            <!-- 上传的附件标签（图片和文本文件） -->
+            <div
+              v-if="uploadedImages.length > 0 || uploadedPlaintexts.length > 0"
+              class="uploaded-images-tags"
+            >
+              <!-- 图片标签 -->
+              <div
+                v-for="(img, index) in uploadedImages"
+                :key="'img-' + index"
+                class="image-tag"
+              >
+                <img
+                  :src="getImageDisplayUrl(img)"
+                  :alt="'图片' + (index + 1)"
+                />
+                <span class="image-tag-text">图片{{ index + 1 }}</span>
+                <button
+                  class="image-tag-remove"
+                  @click="removeImage(index)"
+                  title="移除图片"
+                >
+                  ×
+                </button>
+              </div>
+              <!-- 文本文件标签 -->
+              <div
+                v-for="(txt, index) in uploadedPlaintexts"
+                :key="'txt-' + index"
+                class="image-tag plaintext-tag"
+                @click="previewPlaintext(txt)"
+                title="点击预览内容"
+              >
+                <span class="plaintext-icon">📄</span>
+                <span class="image-tag-text">{{ txt.name }}</span>
+                <button
+                  class="image-tag-remove"
+                  @click.stop="removePlaintext(index)"
+                  title="移除文件"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+
+            <div class="input-wrapper">
+              <!-- 上传按钮（图片或文本文件） -->
+              <button
+                class="upload-btn"
+                @click="triggerUpload"
+                :disabled="!canInput || isUploadingImage"
+                title="上传图片或文本文件"
+              >
+                📎
+              </button>
+              <input
+                type="file"
+                ref="imageInput"
+                accept="image/*"
+                style="display: none"
+                @change="handleImageSelect"
+              />
+              <input
+                type="file"
+                ref="plaintextInput"
+                :accept="getSupportedTextExtensions().join(',')"
+                style="display: none"
+                @change="handlePlaintextSelect"
+              />
+
+              <textarea
+                v-model="messageInput"
+                @input="onInputChange"
+                @keydown="handleKeyDown"
+                @paste="handlePaste"
+                class="message-input can-upload"
+                :placeholder="inputPlaceholder"
+                :disabled="!canInput"
+                rows="1"
+                ref="messageInputRef"
+              ></textarea>
+              <button
+                v-show="messageInput.trim()"
+                @click="clearInput"
+                class="clear-btn"
+                title="清空输入"
+              >
+                ×
+              </button>
+            </div>
+            <button
+              v-if="isCurrentEnd"
+              class="send-btn"
+              @click="createNewSession"
+            >
+              新会话
+            </button>
+            <button
+              v-else-if="(isLoading || isStreaming) && isSentForAWhile"
+              class="send-btn danger"
+              @click="cancelStreaming"
+            >
+              中止
+            </button>
+            <button
+              v-else
+              @click="sendMessage"
+              :disabled="!canSend"
+              class="send-btn"
+            >
+              发送
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 隐藏的搜索结果模板 -->
+      <div v-if="searchRes" ref="searchResTemplate" style="display: none">
+        <div
+          style="
+            text-align: left;
+            max-height: 70vh;
+            overflow-y: auto;
+            padding: 10px;
+          "
+        >
+          <!-- 搜索查询 -->
+          <div style="margin-bottom: 20px">
+            <h3 style="margin: 0 0 10px; color: #333; font-size: 16px">
+              🔍 搜索查询
+            </h3>
+            <div
+              style="
+                padding: 12px;
+                background: #f8f9fa;
+                border-radius: 8px;
+                border-left: 4px solid #a8edea;
+              "
+            >
+              <strong style="color: #2d3748; font-size: 15px"
+                >{{ searchRes.query }}</strong
+              >
+            </div>
+          </div>
+
+          <!-- AI 总结答案 -->
+          <div v-if="searchRes.answer" style="margin-bottom: 20px">
+            <h3 style="margin: 0 0 10px; color: #333; font-size: 16px">
+              💡 AI 总结
+            </h3>
+            <div
+              style="
+                padding: 12px;
+                background: #fff3cd;
+                border-radius: 8px;
+                border-left: 4px solid #ffc107;
+                line-height: 1.6;
+                color: #666;
+                font-size: 14px;
+              "
+            >
+              {{ searchRes.answer }}
+            </div>
+          </div>
+
+          <!-- 搜索结果列表 -->
+          <div v-if="searchRes.results && searchRes.results.length > 0">
+            <div style="margin-bottom: 10px">
+              <h3 style="margin: 0 0 10px; color: #333; font-size: 16px">
+                📚 搜索结果 ({{ searchRes.results.length }} 条)
+              </h3>
+            </div>
+
+            <div
+              v-for="(result, index) in searchRes.results"
+              :key="index"
+              style="
+                margin-bottom: 15px;
+                padding: 15px;
+                background: #ffffff;
+                border: 1px solid #e1e5e9;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+              "
+            >
+              <div style="margin-bottom: 8px">
+                <span
+                  style="
+                    display: inline-block;
+                    padding: 2px 8px;
+                    background: #a8edea;
+                    color: #2d3748;
+                    border-radius: 4px;
+                    font-size: 12px;
+                    font-weight: 500;
+                    margin-right: 8px;
+                  "
+                >
+                  {{ index + 1 }}
+                </span>
+                <strong style="color: #2d3748; font-size: 14px">
+                  {{ result.title || '无标题' }}
+                </strong>
+              </div>
+
+              <div
+                v-if="result.content"
+                style="
+                  margin: 8px 0;
+                  color: #666;
+                  font-size: 13px;
+                  line-height: 1.5;
+                  overflow: hidden;
+                  text-overflow: ellipsis;
+                  display: -webkit-box;
+                  line-clamp: 5;
+                  -webkit-line-clamp: 5;
+                  -webkit-box-orient: vertical;
+                "
+              >
+                {{ result.content.length > 300 ? result.content.slice(0, 300) +
+                '...' : result.content }}
+              </div>
+
+              <div v-if="result.url" style="margin-top: 8px; line-height: 1.5">
+                <a
+                  :href="result.url"
+                  target="_blank"
+                  style="
+                    color: #0066cc;
+                    text-decoration: none;
+                    font-size: 12px;
+                    word-break: break-all;
+                    display: -webkit-box;
+                    line-clamp: 2;
+                    -webkit-line-clamp: 2;
+                    -webkit-box-orient: vertical;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                  "
+                >
+                  🔗 {{ result.url }}
+                </a>
+              </div>
+            </div>
+          </div>
+
+          <!-- 无结果提示 -->
+          <div
+            v-else
+            style="
+              padding: 20px;
+              text-align: center;
+              color: #999;
+              font-size: 14px;
+            "
+          >
+            暂无搜索结果
+          </div>
+        </div>
+      </div>
+
+      <!-- 隐藏的关于页面模板 -->
+      <div ref="aboutTemplate" style="display: none">
+        <div style="max-height: 70vh; overflow-y: auto; text-align: left">
+          <div style="text-align: left; padding: 10px">
+            <h3 style="margin: 0 0 10px; color: #333">✨ 应用简介</h3>
+            <p style="line-height: 1.6; color: #666">
+              这是一个简单易用的 OpenAI API 代理服务，基于 Deno Deploy /
+              Cloudflare Workers 部署。 只需要一个域名和 OpenAI API
+              Key，即可免费为家人朋友提供 AI 问答服务。
+            </p>
+
+            <h3 style="margin: 20px 0 10px; color: #333">🎯 核心功能</h3>
+            <ul style="line-height: 1.8; color: #666; padding-left: 20px">
+              <li>提供标准的 OpenAI API 代理端点</li>
+              <li>支持密码保护，避免暴露 API Key</li>
+              <li>内置精美的 Web 聊天界面</li>
+              <li>PWA 适配，支持移动设备添加到桌面</li>
+              <li>流式响应，实时显示 AI 回答</li>
+              <li>基于 IndexedDB 本地历史记录存储</li>
+              <li>支持模型切换和自定义系统提示词</li>
+              <li>集成 Tavily 搜索，为 AI 提供实时网络信息</li>
+              <li>一键生成问答截图，方便分享</li>
+              <li>智能会话命名，便于查找管理</li>
+            </ul>
+
+            <h3 style="margin: 20px 0 10px; color: #333">🔗 GitHub 仓库</h3>
+            <p style="line-height: 1.6; color: #666">
+              <a
+                href="https://github.com/icheer/openai-webui-lite"
+                target="_blank"
+                style="color: #0066cc; text-decoration: none"
+              >
+                https://github.com/icheer/openai-webui-lite
+              </a>
+            </p>
+
+            <p style="margin: 20px 0 10px; color: #999; font-size: 0.9em">
+              请合理使用 AI 资源，避免滥用！
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- 设置弹窗模板 -->
+      <div
+        v-if="!isShowSettingsModal"
+        ref="settingsTemplate"
+        style="display: none"
+      >
+        <div style="text-align: left; padding: 0 10px">
+          <!-- API Key 设置 -->
+          <div style="margin-bottom: 20px">
+            <label
+              class="label-api-key"
+              style="
+                display: block;
+                margin-bottom: 8px;
+                font-weight: 600;
+                color: #333;
+              "
+            >
+              🔑 API Key
+            </label>
+            <input
+              type="password"
+              id="settingsApiKey"
+              class="swal-input-custom"
+              placeholder="请输入您的 OpenAI API Key"
+              autocomplete="new-password"
+              style="
+                width: 100%;
+                padding: 10px 12px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                font-size: 14px;
+                box-sizing: border-box;
+              "
+            />
+          </div>
+
+          <!-- 存储模式切换 -->
+          <div style="margin-bottom: 20px">
+            <label
+              style="
+                display: block;
+                margin-bottom: 8px;
+                font-weight: 600;
+                color: #333;
+              "
+            >
+              💾 会话存储模式
+            </label>
+            <div style="display: flex; gap: 12px">
+              <label
+                style="
+                  display: flex;
+                  align-items: center;
+                  cursor: pointer;
+                  padding: 10px 10px;
+                  border: 2px solid #ddd;
+                  border-radius: 8px;
+                  flex: 1;
+                  transition: all 0.2s;
+                "
+                class="storage-mode-option"
+                data-mode="local"
+              >
+                <input
+                  type="radio"
+                  name="storageMode"
+                  value="local"
+                  style="margin-right: 8px"
+                />
+                <span style="font-size: 0.85em">
+                  <span v-if="isMobile">📱</span>
+                  <span v-else>🖥️</span>
+                  <span> 本地存储</span>
+                </span>
+              </label>
+              <label
+                style="
+                  display: flex;
+                  align-items: center;
+                  cursor: pointer;
+                  padding: 10px 10px;
+                  border: 2px solid #ddd;
+                  border-radius: 8px;
+                  flex: 1;
+                  transition: all 0.2s;
+                "
+                class="storage-mode-option"
+                data-mode="webdav"
+              >
+                <input
+                  type="radio"
+                  name="storageMode"
+                  value="webdav"
+                  style="margin-right: 8px"
+                />
+                <span style="font-size: 0.85em">☁️ 远程存储</span>
+              </label>
+            </div>
+            <p style="margin: 8px 0 0; font-size: 12px; color: #888">
+              <span>本地存储：数据保存在浏览器中</span>
+              <br v-if="isMobile" />
+              <span v-else>；</span>
+              <span>远程存储：通过 WebDAV 同步到云端</span>
+            </p>
+          </div>
+
+          <!-- WebDAV 配置 -->
+          <div
+            id="webdavConfigSection"
+            style="
+              display: none;
+              padding: 16px;
+              background: #f8f9fa;
+              border-radius: 8px;
+              margin-bottom: 10px;
+            "
+          >
+            <label
+              style="
+                display: block;
+                margin-bottom: 12px;
+                font-weight: 600;
+                color: #333;
+              "
+            >
+              WebDAV 配置
+            </label>
+            <div style="margin-bottom: 12px">
+              <label
+                style="
+                  display: block;
+                  margin-bottom: 4px;
+                  font-size: 13px;
+                  color: #555;
+                "
+                >服务器地址</label
+              >
+              <input
+                type="text"
+                id="webdavUrl"
+                placeholder="http://dav.test.cn:3000"
+                style="
+                  width: 100%;
+                  padding: 8px 12px;
+                  border: 1px solid #ddd;
+                  border-radius: 6px;
+                  font-size: 14px;
+                  box-sizing: border-box;
+                "
+              />
+            </div>
+            <div style="margin-bottom: 12px">
+              <label
+                style="
+                  display: block;
+                  margin-bottom: 4px;
+                  font-size: 13px;
+                  color: #555;
+                "
+                >用户名</label
+              >
+              <input
+                type="text"
+                id="webdavUsername"
+                placeholder="用户名"
+                style="
+                  width: 100%;
+                  padding: 8px 12px;
+                  border: 1px solid #ddd;
+                  border-radius: 6px;
+                  font-size: 14px;
+                  box-sizing: border-box;
+                "
+              />
+            </div>
+            <div style="margin-bottom: 12px">
+              <label
+                style="
+                  display: block;
+                  margin-bottom: 4px;
+                  font-size: 13px;
+                  color: #555;
+                "
+                >密码</label
+              >
+              <input
+                type="password"
+                id="webdavPassword"
+                placeholder="密码"
+                autocomplete="new-password"
+                style="
+                  width: 100%;
+                  padding: 8px 12px;
+                  border: 1px solid #ddd;
+                  border-radius: 6px;
+                  font-size: 14px;
+                  box-sizing: border-box;
+                "
+              />
+            </div>
+            <div style="margin-bottom: 12px">
+              <label
+                style="
+                  display: block;
+                  margin-bottom: 4px;
+                  font-size: 13px;
+                  color: #555;
+                "
+                >存储路径</label
+              >
+              <input
+                type="text"
+                id="webdavPath"
+                placeholder="/openai-chat/"
+                style="
+                  width: 100%;
+                  padding: 8px 12px;
+                  border: 1px solid #ddd;
+                  border-radius: 6px;
+                  font-size: 14px;
+                  box-sizing: border-box;
+                "
+              />
+              <p style="margin: 4px 0 0; font-size: 11px; color: #888">
+                应以'/'结束，留空则使用默认路径 /openai-chat/
+              </p>
+            </div>
+            <button
+              type="button"
+              id="testWebdavBtn"
+              style="
+                width: 100%;
+                padding: 10px;
+                background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+                border: none;
+                border-radius: 6px;
+                font-size: 14px;
+                cursor: pointer;
+                font-weight: 500;
+              "
+            >
+              🔗 测试连接
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const $ = selector => document.querySelector(selector);
+      const $$ = selector => Array.from(document.querySelectorAll(selector));
+      const { createApp } = Vue;
+
+      window.app = createApp({
+        data() {
+          return {
+            apiKey: '',
+            messageInput: '',
+            isLoading: false,
+            isShowSettingsModal: false,
+            isSentForAWhile: false,
+            errorMessage: '',
+            selectedModel: '',
+            availableModels: ['$MODELS_PLACEHOLDER$'],
+            sessions: [],
+            currentSessionId: null,
+            isFoldRole: false,
+            isCapturing: false,
+            globalRolePrompt: '',
+            globalRolePromptEnabled: true,
+            isMobile: window.innerWidth <= 768, // 是否移动设备
+            isWideMode: !!localStorage.getItem('wideMode'),
+            showSidebar: false,
+            isStreaming: false,
+            streamingContent: '',
+            abortController: null,
+            uploadedImages: [], // 待发送的图片列表 [{ url: string, file: File }]
+            uploadedPlaintexts: [], // 待发送的文本文件列表 [{ name: string, content: string }]
+            isUploadingImage: false,
+            needSearch: false,
+            searchRes: null,
+            tomSelect: null,
+            sidebarHashAdded: false, // 标记是否为侧边栏添加了hash
+            swalHashAdded: false, // 标记是否为弹窗添加了hash
+            isLoadingRemoteSessions: false, // 是否正在加载远程会话数据
+            // 存储模式相关
+            storageMode: 'local', // 'local' 或 'webdav'
+            webdavConfig: {
+              url: '',
+              username: '',
+              password: '',
+              path: '/openai-chat/'
+            }
+          };
+        },
+        computed: {
+          isPC() {
+            return !this.isMobile;
+          },
+          hostname() {
+            return window.location.hostname;
+          },
+          isMySite() {
+            return this.hostname.endsWith('.keyi.ma');
+          },
+          currentSession() {
+            return this.sessions.find(s => s.id === this.currentSessionId);
+          },
+          isCurrentEnd() {
+            var session = this.currentSession;
+            if (!session) return false;
+            if (this.isLoading || this.isStreaming) return false;
+            // 获取用户消息数量
+            var userMsgCount = this.getUserMessageCount(session);
+            // 如果用户已发送8条消息，则会话结束
+            if (userMsgCount >= 8) return true;
+            // 或者最后一条消息是bot的回复，用户可以继续追问
+            return false;
+          },
+          // 检查是否已达到最大消息数限制
+          isMaxMessagesReached() {
+            var session = this.currentSession;
+            if (!session) return false;
+            return this.getUserMessageCount(session) >= 8;
+          },
+          // 判断是否正在为新消息生成回复（最后一条是user消息且正在streaming）
+          isStreamingNewAnswer() {
+            if (!this.isLoading && !this.isStreaming) return false;
+            var session = this.currentSession;
+            if (!session || !session.messages || session.messages.length === 0)
+              return false;
+            var lastMsg = session.messages[session.messages.length - 1];
+            return lastMsg.type === 'user';
+          },
+          isTotallyBlank() {
+            const list = this.sessions || [];
+            return !list.some(s => {
+              return s.messages && s.messages.length > 0;
+            });
+          },
+          inputPlaceholder() {
+            var session = this.currentSession || {};
+            var suffix = this.getRolePrompt() ? ' (role ✓)' : '';
+            if (!this.apiKey) {
+              return '请先在左上角设置 API Key';
+            } else if (this.isLoadingRemoteSessions) {
+              return '正在加载远程数据...';
+            } else if (this.isLoading) {
+              return 'AI 正在思考中...';
+            } else if (this.isStreaming) {
+              return 'AI 正在生成回答...';
+            } else if (this.isUploadingImage) {
+              return '图片上传中...';
+            } else if (this.isMaxMessagesReached) {
+              return '当前会话已达到最大消息数限制(8条)';
+            } else if (!this.selectedModel) {
+              return '请选择一个模型';
+            } else if (session.messages && session.messages.length > 0) {
+              return '输入您的追问...' + suffix;
+            } else {
+              return '输入您的问题...' + suffix;
+            }
+          },
+          canInput() {
+            var session = this.currentSession;
+            return (
+              this.apiKey &&
+              !this.isLoadingRemoteSessions &&
+              !this.isLoading &&
+              !this.isStreaming &&
+              !this.isMaxMessagesReached
+            );
+          },
+          canSend() {
+            return (
+              (this.messageInput.trim() ||
+                this.uploadedImages.length > 0 ||
+                this.uploadedPlaintexts.length > 0) &&
+              this.selectedModel &&
+              !this.isUploadingImage &&
+              this.canInput
+            );
+          },
+          canUploadImage() {
+            const isModelSupport = /(gpt|qwen|kimi)/.test(this.selectedModel);
+            return isModelSupport && this.isMySite;
+          },
+          // 判断是否需要显示loading
+          shouldShowLoading() {
+            if (this.isLoading) return true;
+            if (this.isStreaming) {
+              if (!this.streamingContent) return true;
+              if (this.streamingContent.endsWith(' 条相关信息。\n\n'))
+                return true;
+            }
+            return false;
+          },
+          // 判断是否需要显示"重新回答"按钮（有问题但没有回答，且没有正在加载）
+          shouldShowRetryButton() {
+            var session = this.currentSession;
+            if (!session) return false;
+            if (this.isLoading || this.isStreaming) return false;
+            if (!session.messages || session.messages.length === 0)
+              return false;
+            // 最后一条消息是user类型且没有对应的bot回复
+            var lastMsg = session.messages[session.messages.length - 1];
+            return lastMsg.type === 'user';
+          }
+        },
+        async mounted() {
+          this.initModels();
+          this.$nextTick(() => {
+            this.initTomSelect();
+          });
+
+          // 加载WebDAV配置
+          await window.openaiDB.loadWebDAVConfig();
+          this.storageMode = window.openaiDB.webdavEnabled ? 'webdav' : 'local';
+          this.webdavConfig = Object.assign({}, window.openaiDB.webdavConfig);
+
+          // 初始化 IndexedDB
+          await window.openaiDB.init();
+
+          const renderer = new marked.Renderer();
+          const originalHtmlRenderer = renderer.html.bind(renderer);
+          renderer.html = function (text) {
+            // marked 会自动处理代码块内的内容，这里只处理普通文本
+            // 有条件的转义：如果 < 后面不是 a, br, blockquote, details, summary 标签，才进行转义
+            const escaped = text.replace(
+              /<(?!\/?(a|br|blockquote|details|summary)[\s>])/gi,
+              '&lt;'
+            );
+            return originalHtmlRenderer(escaped);
+          };
+
+          // 配置 marked
+          marked.setOptions({
+            renderer,
+            breaks: true, // 支持 GFM 换行
+            gfm: true, // 启用 GitHub Flavored Markdown
+            tables: true, // 支持表格
+            pedantic: false, // 不使用原始的 markdown.pl 规则
+            sanitize: false, // 不清理 HTML（因为我们信任内容）
+            smartLists: true, // 使用更智能的列表行为
+            smartypants: false // 不使用智能标点符号
+          });
+          marked.use({
+            extensions: [
+              {
+                name: 'strongWithCJK',
+                level: 'inline',
+                start(src) {
+                  return src.match(/\*\*/)?.index;
+                },
+                tokenizer(src) {
+                  const rule = /^\*\*([^\*]+?)\*\*/;
+                  const match = rule.exec(src);
+                  if (match) {
+                    return {
+                      type: 'strongWithCJK',
+                      raw: match[0],
+                      text: match[1]
+                    };
+                  }
+                },
+                renderer(token) {
+                  return '<strong>' + token.text + '</strong>';
+                }
+              }
+            ]
+          });
+
+          // 检测是否为移动端
+          this.checkMobile();
+          window.addEventListener('resize', this.checkMobile);
+
+          // 监听浏览器后退事件（移动端体验优化）
+          window.addEventListener('popstate', this.handlePopState);
+
+          await this.loadData();
+          if (this.sessions.length === 0) {
+            this.createNewSession();
+          }
+          // 计算OpenAI DB总数据量
+          const totalDataSize = await window.openaiDB.getTotalDataSize();
+          if (totalDataSize > 3) {
+            this.showSwal({
+              title: '数据量过大',
+              text:
+                '当前存储的数据量为' +
+                totalDataSize.toFixed(2) +
+                ' MB，超过了 3MB，可能会影响性能。建议清理一些旧会话。',
+              icon: 'warning',
+              confirmButtonText: '&nbsp;知道了&nbsp;'
+            });
+          }
+        },
+
+        beforeUnmount() {
+          window.removeEventListener('resize', this.checkMobile);
+          window.removeEventListener('popstate', this.handlePopState);
+        },
+        watch: {
+          messageInput() {
+            this.autoResizeTextarea();
+          },
+          streamingContent() {
+            this.stickToBottom();
+          },
+          selectedModel(newVal, oldVal) {
+            // 避免在初始化时触发保存（空值变为有效值时不保存）
+            if (!oldVal && newVal) {
+              // 首次从空值变为有效值，不触发保存（由 loadData 负责）
+              if (this.tomSelect && this.tomSelect.getValue() !== newVal) {
+                this.tomSelect.setValue(newVal, true);
+              }
+              return;
+            }
+            // 正常的模型切换，更新 TomSelect
+            if (this.tomSelect && this.tomSelect.getValue() !== newVal) {
+              this.tomSelect.setValue(newVal, true);
+            }
+          }
+        },
+        methods: {
+          // 移动端后退体验优化：添加hash锚点
+          addHash(type) {
+            if (!this.isMobile) return;
+            const hash = '#' + type;
+            if (window.location.hash !== hash) {
+              window.history.pushState(null, '', hash);
+            }
+          },
+
+          // 移动端后退体验优化：移除hash锚点
+          removeHash() {
+            if (!this.isMobile) return;
+            if (window.location.hash) {
+              window.history.back();
+            }
+          },
+
+          // 移动端后退体验优化：处理浏览器后退事件
+          handlePopState(event) {
+            if (!this.isMobile) return;
+
+            // 如果侧边栏是打开的，关闭它
+            if (this.showSidebar && this.sidebarHashAdded) {
+              this.showSidebar = false;
+              this.sidebarHashAdded = false;
+              return;
+            }
+
+            // 如果有Swal弹窗打开，关闭它
+            if (Swal.isVisible() && this.swalHashAdded) {
+              Swal.close();
+              this.swalHashAdded = false;
+              return;
+            }
+          },
+
+          // 包装Swal.fire以支持移动端hash管理
+          showSwal(options, addHash = true) {
+            const isMobile = this.isMobile;
+            const originalDidOpen = options.didOpen;
+            const originalWillClose = options.willClose;
+
+            // 扩展didOpen回调
+            options.didOpen = (...args) => {
+              if (isMobile && addHash) {
+                this.addHash('modal');
+                this.swalHashAdded = true;
+              }
+              if (originalDidOpen) {
+                originalDidOpen.apply(this, args);
+              }
+            };
+
+            // 扩展willClose回调
+            options.willClose = (...args) => {
+              if (isMobile && addHash && this.swalHashAdded) {
+                this.removeHash();
+                this.swalHashAdded = false;
+              }
+              if (originalWillClose) {
+                originalWillClose.apply(this, args);
+              }
+            };
+
+            return Swal.fire(options);
+          },
+
+          // 切换PC宽屏模式
+          toggleWideMode(flag = undefined) {
+            this.isWideMode = !this.isWideMode;
+            if (flag === true) {
+              this.isWideMode = true;
+            } else if (flag === false) {
+              this.isWideMode = false;
+            }
+            if (this.isWideMode) {
+              localStorage.setItem('wideMode', '1');
+            } else {
+              localStorage.removeItem('wideMode');
+            }
+          },
+
+          // 打开设置弹窗
+          openSettingsModal() {
+            var template = this.$refs.settingsTemplate;
+            if (!template) return;
+            var htmlContent = template.innerHTML;
+
+            Swal.fire({
+              title: '⚙️ 设置',
+              html: htmlContent,
+              width: this.isMobile ? '95%' : '500px',
+              showCancelButton: true,
+              confirmButtonText: '保存',
+              cancelButtonText: '取消',
+              confirmButtonColor: '#5fbdbd',
+              allowOutsideClick: false,
+              showCloseButton: false,
+              reverseButtons: true,
+              didOpen: async () => {
+                this.isShowSettingsModal = true;
+                await this.$nextTick();
+                // 填充当前值
+                var apiKeyInput = $('#settingsApiKey');
+                if (apiKeyInput) apiKeyInput.value = this.apiKey || '';
+
+                var localRadio = $('input[name="storageMode"][value="local"]');
+                var webdavRadio = $(
+                  'input[name="storageMode"][value="webdav"]'
+                );
+                if (this.storageMode === 'webdav' && webdavRadio) {
+                  webdavRadio.checked = true;
+                } else if (localRadio) {
+                  localRadio.checked = true;
+                }
+
+                // 填充WebDAV配置
+                var urlInput = $('#webdavUrl');
+                var usernameInput = $('#webdavUsername');
+                var passwordInput = $('#webdavPassword');
+                var pathInput = $('#webdavPath');
+                if (urlInput) urlInput.value = this.webdavConfig.url || '';
+                if (usernameInput)
+                  usernameInput.value = this.webdavConfig.username || '';
+                if (passwordInput)
+                  passwordInput.value = this.webdavConfig.password || '';
+                if (pathInput)
+                  pathInput.value = this.webdavConfig.path || '/openai-chat/';
+
+                // 显示/隐藏WebDAV配置区域
+                var webdavSection = $('#webdavConfigSection');
+                if (webdavSection) {
+                  webdavSection.style.display =
+                    this.storageMode === 'webdav' ? 'block' : 'none';
+                }
+
+                // 更新选中状态样式
+                this.updateStorageModeStyle();
+
+                // 绑定存储模式切换事件
+                var radios = $$('input[name="storageMode"]');
+                radios.forEach(radio => {
+                  radio.addEventListener('change', () => {
+                    var webdavSection = $('#webdavConfigSection');
+                    if (webdavSection) {
+                      webdavSection.style.display =
+                        radio.value === 'webdav' ? 'block' : 'none';
+                    }
+                    this.updateStorageModeStyle();
+                  });
+                });
+
+                // 绑定测试按钮事件
+                var testBtn = $('#testWebdavBtn');
+                if (testBtn) {
+                  testBtn.addEventListener('click', () => {
+                    this.testWebDAVFromModal();
+                  });
+                }
+
+                var title = $('.swal2-modal .swal2-title');
+                if (title) {
+                  title.addEventListener('dblclick', () => {
+                    this.reloadPage();
+                  });
+                }
+              },
+              preConfirm: async () => {
+                const isValid = await this.validateAndSaveSettings();
+                if (isValid) {
+                  this.isShowSettingsModal = false;
+                }
+                return isValid;
+              }
+            }).then(() => {
+              this.isShowSettingsModal = false;
+            });
+          },
+
+          // 更新存储模式选项样式
+          updateStorageModeStyle() {
+            var options = $$('.storage-mode-option');
+            options.forEach(option => {
+              var radio = option.querySelector('input[type="radio"]');
+              if (radio && radio.checked) {
+                option.style.borderColor = '#5fbdbd';
+                option.style.background = 'rgba(95, 189, 189, 0.1)';
+              } else {
+                option.style.borderColor = '#ddd';
+                option.style.background = 'transparent';
+              }
+            });
+          },
+
+          // 从弹窗中测试WebDAV连接
+          async testWebDAVFromModal() {
+            var urlInput = $('#webdavUrl');
+            var usernameInput = $('#webdavUsername');
+            var passwordInput = $('#webdavPassword');
+            var pathInput = $('#webdavPath');
+            var testBtn = $('#testWebdavBtn');
+            var config = {
+              url: urlInput ? urlInput.value.trim() : '',
+              username: usernameInput ? usernameInput.value.trim() : '',
+              password: passwordInput ? passwordInput.value : '',
+              path: (pathInput ? pathInput.value.trim() : '') || '/openai-chat/'
+            };
+
+            // 基本验证
+            if (!config.url) {
+              this.showToast('请输入服务器地址', 'error');
+              return;
+            }
+            if (!config.username) {
+              this.showToast('请输入用户名', 'error');
+              return;
+            }
+            if (!config.password) {
+              this.showToast('请输入密码', 'error');
+              return;
+            }
+
+            // 显示测试中状态
+            if (testBtn) {
+              testBtn.disabled = true;
+              testBtn.textContent = '⏳ 测试中...';
+            }
+
+            var result = await window.openaiDB.testWebDAVConnection(config);
+
+            if (testBtn) {
+              testBtn.disabled = false;
+              testBtn.textContent = '🔗 测试连接';
+            }
+
+            if (result.success) {
+              this.showToast('连接成功！', 'success');
+            } else {
+              this.showToast('连接失败: ' + result.error, 'error');
+            }
+          },
+
+          // 显示Toast提示（不影响Swal弹窗）
+          showToast(message, icon) {
+            // 创建toast容器（如果不存在）
+            var container = $('#custom-toast-container');
+            if (!container) {
+              container = document.createElement('div');
+              container.id = 'custom-toast-container';
+              container.style.cssText =
+                'position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 99999; display: flex; flex-direction: column; align-items: center; gap: 10px; pointer-events: none;';
+              document.body.appendChild(container);
+            }
+
+            // 创建toast元素
+            var toast = document.createElement('div');
+            toast.style.cssText =
+              'padding: 12px 20px; border-radius: 8px; background: #fff; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: flex; align-items: center; gap: 8px; font-size: 14px; opacity: 0; transform: translateY(-10px); transition: all 0.3s ease; pointer-events: auto;';
+
+            // 根据icon类型设置颜色和图标
+            var iconEmoji = '💬';
+            var bgColor = '#fff';
+            var borderColor = '#e0e0e0';
+            if (icon === 'success') {
+              iconEmoji = '✅';
+              borderColor = '#5fbdbd';
+            } else if (icon === 'error') {
+              iconEmoji = '❌';
+              borderColor = '#e74c3c';
+            } else if (icon === 'warning') {
+              iconEmoji = '⚠️';
+              borderColor = '#f39c12';
+            } else if (icon === 'info') {
+              iconEmoji = 'ℹ️';
+              borderColor = '#3498db';
+            }
+            toast.style.borderLeft = '4px solid ' + borderColor;
+
+            toast.innerHTML =
+              '<span style="font-size: 16px;">' +
+              iconEmoji +
+              '</span><span>' +
+              message +
+              '</span>';
+            container.appendChild(toast);
+
+            // 显示动画
+            requestAnimationFrame(() => {
+              toast.style.opacity = '1';
+              toast.style.transform = 'translateY(0)';
+            });
+
+            // 3秒后隐藏并移除
+            this.sleep(3000).then(() => {
+              toast.style.opacity = '0';
+              toast.style.transform = 'translateY(-10px)';
+              this.sleep(300).then(() => {
+                if (toast.parentNode) {
+                  toast.parentNode.removeChild(toast);
+                }
+              });
+            });
+          },
+
+          // 验证并保存设置
+          async validateAndSaveSettings() {
+            var apiKeyInput = $('#settingsApiKey');
+            var apiKey = apiKeyInput ? apiKeyInput.value.trim() : '';
+
+            var storageModeRadio = $('input[name="storageMode"]:checked');
+            var storageMode = storageModeRadio
+              ? storageModeRadio.value
+              : 'local';
+
+            // API Key 验证
+            if (!apiKey) {
+              this.showToast('请输入 API Key', 'error');
+              return false;
+            }
+
+            // 在保存前记录旧的存储模式，用于后续判断是否切换了模式
+            var oldMode = window.openaiDB.webdavEnabled ? 'webdav' : 'local';
+
+            // 如果选择了WebDAV，验证配置
+            if (storageMode === 'webdav') {
+              var urlInput = $('#webdavUrl');
+              var usernameInput = $('#webdavUsername');
+              var passwordInput = $('#webdavPassword');
+              var pathInput = $('#webdavPath');
+
+              var webdavConfig = {
+                url: urlInput ? urlInput.value.trim() : '',
+                username: usernameInput ? usernameInput.value.trim() : '',
+                password: passwordInput ? passwordInput.value : '',
+                path:
+                  (pathInput ? pathInput.value.trim() : '') || '/openai-chat/'
+              };
+
+              // WebDAV必填项验证
+              if (!webdavConfig.url) {
+                this.showToast('请输入 WebDAV 服务器地址', 'error');
+                return false;
+              }
+              if (!webdavConfig.username) {
+                this.showToast('请输入 WebDAV 用户名', 'error');
+                return false;
+              }
+              if (!webdavConfig.password) {
+                this.showToast('请输入 WebDAV 密码', 'error');
+                return false;
+              }
+
+              // WebDAV连通性测试
+              Swal.showLoading();
+              var result =
+                await window.openaiDB.testWebDAVConnection(webdavConfig);
+              if (!result.success) {
+                Swal.hideLoading();
+                this.showToast('WebDAV 连接失败: ' + result.error, 'error');
+                return false;
+              }
+
+              // 保存WebDAV配置
+              this.webdavConfig = webdavConfig;
+              await window.openaiDB.saveWebDAVConfig(true, webdavConfig);
+              this.storageMode = 'webdav';
+            } else {
+              // 本地存储模式
+              await window.openaiDB.saveWebDAVConfig(false, this.webdavConfig);
+              this.storageMode = 'local';
+            }
+
+            // 保存API Key
+            this.apiKey = apiKey;
+            await this.saveApiKey();
+
+            // 如果切换了存储模式，需要重新加载数据
+            if (oldMode !== storageMode) {
+              // 重新加载会话数据
+              this.showToast('存储模式已切换，正在重新加载数据...', 'info');
+              await this.loadSessions();
+            }
+
+            this.showToast('设置已保存', 'success');
+            return true;
+          },
+
+          // 加载会话数据（独立方法）
+          async loadSessions() {
+            var savedSessions =
+              await window.openaiDB.getItem('openai_sessions');
+            if (savedSessions) {
+              var parsed = JSON.parse(savedSessions);
+              var migratedSessions = this.migrateSessionData(parsed);
+              if (migratedSessions) {
+                this.sessions = migratedSessions;
+              } else {
+                this.sessions = parsed;
+              }
+            } else {
+              this.sessions = [];
+            }
+
+            // 加载当前会话ID
+            var savedCurrentId = await window.openaiDB.getItem(
+              'openai_current_session'
+            );
+            if (
+              savedCurrentId &&
+              this.sessions.find(s => s.id === savedCurrentId)
+            ) {
+              this.currentSessionId = savedCurrentId;
+            } else if (this.sessions.length > 0) {
+              this.currentSessionId = this.sessions[0].id;
+            } else {
+              this.createNewSession();
+            }
+          },
+
+          initTomSelect() {
+            if (this.tomSelect) return;
+            if (this.availableModels.length <= 10) return;
+            const el = $('#selectedModel');
+            if (!el) return;
+            const config = {
+              plugins: ['dropdown_input'],
+              valueField: 'value',
+              labelField: 'label',
+              searchField: ['label', 'value'],
+              options: this.availableModels,
+              items: [this.selectedModel],
+              create: false,
+              maxOptions: 100,
+              maxItems: 1,
+              render: {
+                option: (data, escape) => {
+                  return (
+                    '<div>' +
+                    '<span class="title">' +
+                    escape(data.label) +
+                    '</span>' +
+                    '</div>'
+                  );
+                },
+                item: (data, escape) => {
+                  return '<div>' + escape(data.label) + '</div>';
+                },
+                no_results: (data, escape) => {
+                  return '<div class="no-results" style="padding: 0.75em; text-align: center; color: #999;">查无此项</div>';
+                }
+              },
+              onChange: value => {
+                this.selectedModel = value;
+                this.saveData();
+              },
+              onDelete: () => false,
+              onInitialize: () => {
+                const input = $('.dropdown-input-wrap input');
+                if (!input) return;
+                input.style.paddingLeft = '12px';
+                input.style.paddingRight = '12px';
+                input.setAttribute('placeholder', '模型关键词');
+              }
+            };
+            const tomSelect = new TomSelect(el, config);
+            this.tomSelect = tomSelect;
+            document.body.ontouchmove = e => {
+              const isInDropdown = e.target.closest('.ts-dropdown');
+              const isDropdownOpen = tomSelect.isOpen;
+              if (isDropdownOpen && !isInDropdown) {
+                tomSelect.close();
+              }
+            };
+          },
+          initModels() {
+            const firstItem = this.availableModels[0];
+            if (typeof firstItem === 'string') {
+              this.availableModels = firstItem
+                .trim()
+                .split(',')
+                .map(id => id.trim())
+                .filter(id => id)
+                .map(id => {
+                  if (id.includes('=')) {
+                    const [value, label] = id.split('=').map(s => s.trim());
+                    return { value, label };
+                  }
+                  const parts = id.split('-');
+                  parts.forEach((part, index) => {
+                    if (part.includes('/')) {
+                      const idx = part.indexOf('/');
+                      part =
+                        part.slice(0, idx + 1) +
+                        (part.charAt(idx + 1) || '').toUpperCase() +
+                        part.slice(idx + 2);
+                    }
+                    parts[index] = part.charAt(0).toUpperCase() + part.slice(1);
+                  });
+                  let label = parts.join(' ');
+                  label = label
+                    .replace(' Vl ', ' VL ')
+                    .replace('Deepseek', 'DeepSeek')
+                    .replace('Maxthinking', 'MaxThinking')
+                    .replace('Glm', 'GLM')
+                    .replace('Gpt', 'GPT')
+                    .replace(' Cc', ' CC')
+                    .replace('Or/', 'OR/')
+                    .replace('Cs/', 'CS/')
+                    .replace('Iflow/', 'iFlow/')
+                    .replace('Gcli', 'gCLI')
+                    .replace('Cpa/', 'CPA/')
+                    .replace('B4u/', 'B4U/')
+                    .replace('Kfc/', 'KFC/')
+                    .replace('/', ' / ');
+                  return {
+                    value: id,
+                    label: label
+                  };
+                });
+            }
+          },
+          reloadPage() {
+            location.reload();
+          },
+          // 备用的花括号解析方法，用于处理特殊情况
+          parseWithBraceMethod(inputBuffer) {
+            let buffer = inputBuffer;
+            let braceCount = 0;
+            let startIndex = -1;
+            let processed = false;
+
+            for (let i = 0; i < buffer.length; i++) {
+              if (buffer[i] === '{') {
+                if (braceCount === 0) {
+                  startIndex = i;
+                }
+                braceCount++;
+              } else if (buffer[i] === '}') {
+                braceCount--;
+                if (braceCount === 0 && startIndex !== -1) {
+                  // 找到完整的JSON对象
+                  const jsonStr = buffer.substring(startIndex, i + 1);
+
+                  try {
+                    const data = JSON.parse(jsonStr);
+
+                    if (
+                      data.candidates &&
+                      data.candidates[0] &&
+                      data.candidates[0].content
+                    ) {
+                      const content = data.candidates[0].content;
+                      const delta =
+                        (content &&
+                          content.parts[0] &&
+                          content.parts[0].text) ||
+                        '';
+                      if (delta) {
+                        const shouldScroll = !this.streamingContent;
+                        this.streamingContent += delta;
+                        if (shouldScroll) {
+                          this.scrollToBottom();
+                        }
+                      }
+                      processed = true;
+                    }
+                  } catch (parseError) {
+                    console.warn(
+                      '花括号解析方法也失败:',
+                      parseError,
+                      'JSON:',
+                      jsonStr
+                    );
+                  }
+
+                  // 移除已处理的部分
+                  buffer = buffer.substring(i + 1);
+                  i = -1; // 重置循环
+                  startIndex = -1;
+                  braceCount = 0;
+                }
+              }
+            }
+
+            return { buffer, processed };
+          },
+
+          sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+          },
+
+          // 数据迁移：将旧格式(question/answer/question2/answer2)转换为新的messages数组格式
+          migrateSessionData(sessions) {
+            if (!sessions || !Array.isArray(sessions)) return sessions;
+            let migrated = false;
+            sessions.forEach(session => {
+              // 如果已经有messages数组，跳过
+              if (session.messages && Array.isArray(session.messages)) return;
+              // 初始化messages数组
+              session.messages = [];
+              // 迁移第一轮问答
+              if (session.question) {
+                session.messages.push({
+                  type: 'user',
+                  content: session.question,
+                  images: session.images || [],
+                  time: session.createdAt || '',
+                  model: session.model || ''
+                });
+                migrated = true;
+              }
+              if (session.answer) {
+                session.messages.push({
+                  type: 'bot',
+                  content: session.answer,
+                  time: session.createdAt || '',
+                  model: session.model || ''
+                });
+                migrated = true;
+              }
+              // 迁移第二轮问答
+              if (session.question2) {
+                session.messages.push({
+                  type: 'user',
+                  content: session.question2,
+                  images: session.images2 || [],
+                  time: session.createdAt2 || '',
+                  model: session.model2 || ''
+                });
+                migrated = true;
+              }
+              if (session.answer2) {
+                session.messages.push({
+                  type: 'bot',
+                  content: session.answer2,
+                  time: session.createdAt2 || '',
+                  model: session.model2 || ''
+                });
+                migrated = true;
+              }
+              // 删除旧属性
+              delete session.question;
+              delete session.answer;
+              delete session.question2;
+              delete session.answer2;
+              delete session.images;
+              delete session.images2;
+              delete session.createdAt;
+              delete session.createdAt2;
+              delete session.model;
+              delete session.model2;
+            });
+            if (migrated) {
+              console.log(
+                '[Migration] Sessions migrated to new messages format'
+              );
+              return sessions;
+            } else {
+              return false;
+            }
+          },
+
+          async loadData() {
+            // 加载 API Key
+            this.apiKey =
+              (await window.openaiDB.getItem('openai_api_key')) || '';
+
+            // 加载全局角色设定
+            this.globalRolePrompt =
+              (await window.openaiDB.getItem('openai_global_role_prompt')) ||
+              '';
+            this.globalRolePromptEnabled =
+              (await window.openaiDB.getItem(
+                'openai_global_role_prompt_enabled'
+              )) !== false;
+
+            // 加载当前会话ID
+            const savedCurrentId = await window.openaiDB.getItem(
+              'openai_current_session'
+            );
+
+            // 加载选中的模型
+            const savedModel = await window.openaiDB.getItem(
+              'openai_selected_model'
+            );
+            // 验证 savedModel 是否在可用模型列表中
+            let modelToUse = '';
+            // 优先级1: 使用保存的模型（如果在列表中）
+            if (
+              savedModel &&
+              this.availableModels.length > 0 &&
+              this.availableModels.some(m => m.value === savedModel)
+            ) {
+              modelToUse = savedModel;
+            }
+            // 优先级2: 如果没有保存的模型或不在列表中，使用列表第一个
+            else if (
+              this.availableModels.length > 0 &&
+              this.availableModels[0] &&
+              this.availableModels[0].value
+            ) {
+              modelToUse = this.availableModels[0].value;
+            }
+            // 优先级3: 完全没办法，使用硬编码兜底（但记录警告）
+            else {
+              console.warn('[Model] 模型列表未正确初始化，使用兜底值');
+              modelToUse = 'gpt-4o-mini';
+            }
+            this.selectedModel = modelToUse;
+
+            // 加载联网搜索开关状态
+            this.needSearch = !!(await window.openaiDB.getItem(
+              'openai_enable_search'
+            ));
+
+            // 加载会话数据
+            const savedSessions =
+              await window.openaiDB.getItem('openai_sessions');
+            if (savedSessions) {
+              let parsed = JSON.parse(savedSessions);
+              // 执行数据迁移
+              const migratedSessions = this.migrateSessionData(parsed);
+              if (migratedSessions) {
+                this.sessions = migratedSessions;
+                // 迁移后保存
+                this.sleep(300).then(() => {
+                  this.saveData();
+                });
+              } else {
+                this.sessions = parsed;
+              }
+            }
+
+            // 设置当前会话ID
+            if (
+              savedCurrentId &&
+              this.sessions.find(s => s.id === savedCurrentId)
+            ) {
+              this.currentSessionId = savedCurrentId;
+            } else if (this.sessions.length > 0) {
+              this.currentSessionId = this.sessions[0].id;
+            }
+            this.autoFoldRolePrompt();
+            this.loadDraftFromCurrentSession(); // 加载当前会话的草稿
+
+            // 首次向用户询问 API Key
+            if (!this.apiKey && this.isTotallyBlank) {
+              this.askApiKeyIfNeeded();
+            }
+          },
+
+          async saveData() {
+            await window.openaiDB.setItem(
+              'openai_sessions',
+              JSON.stringify(this.sessions)
+            );
+            await window.openaiDB.setItem(
+              'openai_current_session',
+              this.currentSessionId
+            );
+            await window.openaiDB.setItem(
+              'openai_selected_model',
+              this.selectedModel
+            );
+            await window.openaiDB.setItem(
+              'openai_enable_search',
+              this.needSearch
+            );
+          },
+
+          async saveApiKey() {
+            await window.openaiDB.setItem('openai_api_key', this.apiKey);
+          },
+
+          askApiKeyIfNeeded() {
+            if (this.apiKey) return;
+            this.showSwal({
+              title: '请输入 API Key',
+              input: 'password',
+              inputPlaceholder: '请输入您的 OpenAI API Key',
+              showCancelButton: true,
+              confirmButtonText: '保存',
+              cancelButtonText: '取消',
+              reverseButtons: true,
+              preConfirm: value => {
+                if (!value) {
+                  Swal.showValidationMessage('API Key 不能为空');
+                  return false;
+                }
+                this.apiKey = value;
+                this.saveApiKey();
+              }
+            });
+          },
+
+          createNewSession() {
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+            // 保存当前会话的草稿
+            this.saveDraftToCurrentSession();
+            const firstSession = this.sessions[0];
+            // 检查第一个会话是否为空（没有消息）
+            var isFirstEmpty =
+              firstSession &&
+              (!firstSession.messages || firstSession.messages.length === 0);
+            if (isFirstEmpty) {
+              this.currentSessionId = firstSession.id;
+            } else {
+              var newSession = {
+                id: Date.now().toString(),
+                title: '新会话',
+                summary: '',
+                role: '',
+                draft: '',
+                messages: [] // 使用消息数组代替固定属性
+              };
+              this.sessions.unshift(newSession);
+              this.currentSessionId = newSession.id;
+            }
+            // 加载新会话的草稿
+            this.loadDraftFromCurrentSession();
+            this.saveData();
+            // 移动端创建新会话后隐藏侧边栏
+            if (this.isMobile) {
+              this.hideSidebar();
+            }
+          },
+
+          switchSession(sessionId) {
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+            // 保存当前会话的草稿
+            this.saveDraftToCurrentSession();
+            this.currentSessionId = sessionId;
+            // 加载新会话的草稿
+            this.loadDraftFromCurrentSession();
+            this.saveData();
+            // 移动端切换会话后隐藏侧边栏
+            if (this.isMobile) {
+              this.hideSidebar();
+            }
+            this.scrollToTop();
+          },
+
+          deleteSession(sessionId) {
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+            const doDelete = () => {
+              this.sessions = this.sessions.filter(s => s.id !== sessionId);
+              if (this.currentSessionId === sessionId) {
+                this.currentSessionId =
+                  this.sessions.length > 0 ? this.sessions[0].id : null;
+              }
+              if (this.sessions.length === 0) {
+                this.createNewSession();
+              }
+              this.loadDraftFromCurrentSession();
+              this.saveData();
+            };
+            // 如果是空会话, 直接删除
+            const session = this.sessions.find(s => s.id === sessionId);
+            if (!session) return;
+            const isEmpty =
+              (!session.messages || session.messages.length === 0) &&
+              !session.draft;
+            if (isEmpty) {
+              doDelete();
+              return;
+            }
+            this.showSwal(
+              {
+                title: '确认删除',
+                text: '您确定要删除这个会话吗？',
+                icon: 'warning',
+                showCancelButton: true,
+                confirmButtonColor: '#d33',
+                confirmButtonText: '删除',
+                cancelButtonText: '取消',
+                reverseButtons: true
+              },
+              false
+            ).then(result => {
+              if (result.isConfirmed) {
+                doDelete();
+              }
+            });
+          },
+
+          // 获取会话中用户消息的数量
+          getUserMessageCount(session) {
+            if (!session || !session.messages) return 0;
+            return session.messages.filter(m => m.type === 'user').length;
+          },
+
+          updateRolePrompt() {
+            this.saveData();
+          },
+
+          async updateGlobalRolePrompt() {
+            if (!this.globalRolePrompt && !this.globalRolePromptEnabled) {
+              this.globalRolePromptEnabled = true;
+              return;
+            }
+            await window.openaiDB.setItem(
+              'openai_global_role_prompt',
+              this.globalRolePrompt
+            );
+            await window.openaiDB.setItem(
+              'openai_global_role_prompt_enabled',
+              this.globalRolePromptEnabled
+            );
+          },
+
+          getRolePrompt() {
+            if (this.globalRolePromptEnabled) {
+              return this.globalRolePrompt.trim();
+            }
+            return '';
+          },
+
+          clearRolePrompt() {
+            this.globalRolePrompt = '';
+            this.globalRolePromptEnabled = true;
+            this.updateGlobalRolePrompt();
+          },
+
+          toggleRolePrompt() {
+            this.globalRolePromptEnabled = !this.globalRolePromptEnabled;
+            this.updateGlobalRolePrompt();
+          },
+
+          // 触发上传（图片或文本文件）
+          triggerUpload() {
+            this.showSwal({
+              title: '选择上传类型',
+              showCancelButton: true,
+              showDenyButton: true,
+              confirmButtonText: '📷 图片',
+              denyButtonText: '📄 文本文件',
+              cancelButtonText: '取消',
+              confirmButtonColor: '#5fbdbd',
+              denyButtonColor: '#9b8ed4',
+              reverseButtons: false
+            }).then(result => {
+              if (result.isConfirmed) {
+                this.triggerImageUpload();
+              } else if (result.isDenied) {
+                this.triggerPlaintextUpload();
+              }
+            });
+          },
+
+          // 触发图片上传
+          triggerImageUpload() {
+            if (this.uploadedImages.length >= 5) {
+              this.showSwal({
+                title: '无法上传',
+                text: '最多只能上传5张图片',
+                icon: 'warning',
+                confirmButtonText: '确定'
+              });
+              return;
+            }
+            this.preheatImageUploadService();
+            this.$refs.imageInput.click();
+          },
+
+          // 触发文本文件上传
+          triggerPlaintextUpload() {
+            if (this.uploadedPlaintexts.length >= 5) {
+              this.showSwal({
+                title: '无法上传',
+                text: '最多只能上传5个文本文件',
+                icon: 'warning',
+                confirmButtonText: '确定'
+              });
+              return;
+            }
+            this.$refs.plaintextInput.click();
+          },
+
+          // 获取支持的文本文件后缀列表
+          getSupportedTextExtensions() {
+            return [
+              '.txt',
+              '.md',
+              '.markdown',
+              '.html',
+              '.htm',
+              '.xml',
+              '.json',
+              '.js',
+              '.jsx',
+              '.ts',
+              '.tsx',
+              '.vue',
+              '.svelte',
+              '.css',
+              '.scss',
+              '.sass',
+              '.less',
+              '.styl',
+              '.py',
+              '.pyw',
+              '.pyi',
+              '.rb',
+              '.php',
+              '.java',
+              '.kt',
+              '.kts',
+              '.c',
+              '.cpp',
+              '.cc',
+              '.cxx',
+              '.h',
+              '.hpp',
+              '.hxx',
+              '.cs',
+              '.go',
+              '.rs',
+              '.swift',
+              '.m',
+              '.mm',
+              '.sh',
+              '.bash',
+              '.zsh',
+              '.fish',
+              '.ps1',
+              '.bat',
+              '.cmd',
+              '.sql',
+              '.graphql',
+              '.gql',
+              '.yaml',
+              '.yml',
+              '.toml',
+              '.ini',
+              '.conf',
+              '.cfg',
+              '.env',
+              '.log',
+              '.csv',
+              '.tsv',
+              '.tex',
+              '.bib',
+              '.rst',
+              '.adoc',
+              '.org',
+              '.gitignore',
+              '.dockerignore',
+              '.editorconfig',
+              '.eslintrc',
+              '.prettierrc',
+              '.babelrc',
+              '.htaccess',
+              '.nginx',
+              '.conf',
+              '.r',
+              '.R',
+              '.rmd',
+              '.Rmd',
+              '.lua',
+              '.pl',
+              '.pm',
+              '.tcl',
+              '.awk',
+              '.sed',
+              '.vim',
+              '.vimrc',
+              '.emacs',
+              '.el',
+              '.proto',
+              '.thrift',
+              '.avsc',
+              '.tf',
+              '.tfvars',
+              '.hcl',
+              '.gradle',
+              '.properties',
+              '.pom',
+              '.cmake',
+              '.make',
+              '.makefile',
+              '.mk',
+              '.asm',
+              '.s',
+              '.nasm',
+              '.patch',
+              '.diff'
+            ];
+          },
+
+          // 处理文本文件选择
+          async handlePlaintextSelect(event) {
+            var file = event.target.files[0];
+            if (!file) return;
+            await this.processPlaintextFile(file);
+            event.target.value = ''; // 清空input,允许重复选择同一文件
+          },
+
+          // 处理文本文件（公共逻辑）
+          async processPlaintextFile(file) {
+            // 检查文件数量限制
+            if (this.uploadedPlaintexts.length >= 5) {
+              this.showSwal({
+                title: '无法上传',
+                text: '最多只能上传5个文本文件',
+                icon: 'warning',
+                confirmButtonText: '确定'
+              });
+              return;
+            }
+
+            // 检查文件后缀
+            var fileName = file.name || '';
+            var ext =
+              fileName.lastIndexOf('.') > -1
+                ? fileName.substring(fileName.lastIndexOf('.')).toLowerCase()
+                : '';
+            var supportedExts = this.getSupportedTextExtensions();
+            // 如果有后缀但不在支持列表中，提示用户
+            if (ext && supportedExts.indexOf(ext) === -1) {
+              this.showSwal({
+                title: '不支持的文件类型',
+                text: '请选择文本文件，如 .txt, .md, .js, .py 等',
+                icon: 'error',
+                confirmButtonText: '确定'
+              });
+              return;
+            }
+
+            // 检查文件大小 (限制1MB)
+            if (file.size > 1 * 1024 * 1024) {
+              this.showSwal({
+                title: '文件过大',
+                text: '文本文件大小不能超过1MB',
+                icon: 'error',
+                confirmButtonText: '确定'
+              });
+              return;
+            }
+
+            // 检查是否已经上传过同名文件
+            var isDuplicate = this.uploadedPlaintexts.some(
+              item => item.name === fileName
+            );
+            if (isDuplicate) {
+              this.showSwal({
+                title: '文件已存在',
+                text: '已经上传过同名文件: ' + fileName,
+                icon: 'warning',
+                confirmButtonText: '确定'
+              });
+              return;
+            }
+
+            // 读取文件内容
+            try {
+              var content = await this.readFileAsText(file);
+              this.uploadedPlaintexts.push({
+                name: fileName,
+                content: content
+              });
+            } catch (error) {
+              console.error('读取文件失败:', error);
+              this.showSwal({
+                title: '读取失败',
+                text: '无法读取文件内容，请确保是有效的文本文件',
+                icon: 'error',
+                confirmButtonText: '确定'
+              });
+            }
+          },
+
+          // 读取文件为文本
+          readFileAsText(file) {
+            return new Promise((resolve, reject) => {
+              var reader = new FileReader();
+              reader.onload = () => {
+                resolve(reader.result);
+              };
+              reader.onerror = () => {
+                reject(reader.error);
+              };
+              reader.readAsText(file, 'UTF-8');
+            });
+          },
+
+          // 移除文本文件
+          removePlaintext(index) {
+            this.uploadedPlaintexts.splice(index, 1);
+          },
+
+          // 清空上传的文本文件
+          clearUploadedPlaintexts() {
+            this.uploadedPlaintexts = [];
+          },
+
+          // 预览文本文件内容
+          previewPlaintext(item) {
+            var content = item.content || '';
+            // 截取前3000字符预览
+            var previewContent =
+              content.length > 3000
+                ? content.substring(0, 3000) + '\n\n... (内容过长，已截断)'
+                : content;
+            this.showSwal({
+              title: item.name,
+              html:
+                '<pre style="text-align: left; max-height: 60vh; overflow: auto; white-space: pre-wrap; word-wrap: break-word; background: #f5f5f5; padding: 12px; border-radius: 8px; font-size: 13px;">' +
+                this.escapeHtml(previewContent) +
+                '</pre>',
+              width: this.isMobile ? '95%' : '700px',
+              showConfirmButton: true,
+              confirmButtonText: '关闭'
+            });
+          },
+
+          // HTML转义
+          escapeHtml(text) {
+            var div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+          },
+
+          // 构建附件内容字符串
+          buildAttachmentContent(plaintexts) {
+            if (!plaintexts || plaintexts.length === 0) return '';
+            var lines = [];
+            lines.push(
+              '\n\n---\n\n## 附件\n\n**以下是用户提供的附件内容，以 \`<User_Attachment_数字>\` 包裹：**'
+            );
+            for (var i = 0; i < plaintexts.length; i++) {
+              var item = plaintexts[i];
+              var num = i + 1;
+              lines.push('\n\n---\n\n### 附件 ' + num + ':\n\n');
+              lines.push(
+                '<User_Attachment_' + num + ' filename="' + item.name + '">'
+              );
+              lines.push(item.content);
+              lines.push('</User_Attachment_' + num + '>');
+            }
+            return lines.join('\n');
+          },
+
+          // 预先调用上传图片服务的/health接口,以减少首次上传延迟
+          async preheatImageUploadService() {
+            if (!this.isMySite) return;
+            return fetch('https://pic.keyi.ma/health')
+              .then(() => {})
+              .catch(() => {});
+          },
+
+          // 处理粘贴事件
+          async handlePaste(event) {
+            var clipboardData = event.clipboardData || window.clipboardData;
+            if (!clipboardData) return;
+            var items = clipboardData.items;
+            if (!items || !items.length) return;
+
+            // 遍历剪贴板项目
+            for (var i = 0; i < items.length; i++) {
+              var item = items[i];
+
+              // 检查是否为图片类型
+              if (item.type.startsWith('image/')) {
+                event.preventDefault(); // 阻止默认粘贴行为
+
+                // 检查是否已达到上传限制
+                if (this.uploadedImages.length >= 5) {
+                  this.showSwal({
+                    title: '无法上传',
+                    text: '最多只能上传5张图片',
+                    icon: 'warning',
+                    confirmButtonText: '确定'
+                  });
+                  return;
+                }
+
+                // 获取图片文件
+                var file = item.getAsFile();
+                if (!file) continue;
+
+                // 检查文件大小 (限制10MB)
+                if (file.size > 10 * 1024 * 1024) {
+                  this.showSwal({
+                    title: '文件过大',
+                    text: '图片大小不能超过10MB',
+                    icon: 'error',
+                    confirmButtonText: '确定'
+                  });
+                  return;
+                }
+
+                if (i === 0) {
+                  await this.preheatImageUploadService();
+                }
+                // 上传图片
+                await this.uploadImageFile(file);
+                return; // 只处理第一张图片
+              }
+
+              // 检查是否为文本文件类型
+              if (
+                item.kind === 'file' &&
+                (item.type.startsWith('text/') ||
+                  item.type === 'application/json' ||
+                  item.type === 'application/javascript' ||
+                  item.type === 'application/xml' ||
+                  item.type === '')
+              ) {
+                var textFile = item.getAsFile();
+                if (!textFile) continue;
+
+                // 检查文件名后缀是否支持
+                var fileName = textFile.name || '';
+                var ext =
+                  fileName.lastIndexOf('.') > -1
+                    ? fileName
+                        .substring(fileName.lastIndexOf('.'))
+                        .toLowerCase()
+                    : '';
+                var supportedExts = this.getSupportedTextExtensions();
+
+                // 如果有后缀且在支持列表中，处理文本文件
+                if (ext && supportedExts.indexOf(ext) !== -1) {
+                  event.preventDefault();
+                  await this.processPlaintextFile(textFile);
+                  return;
+                }
+              }
+            }
+          },
+
+          // 上传图片文件（提取公共逻辑）
+          async uploadImageFile(file) {
+            this.isUploadingImage = true;
+            try {
+              // 如果当前模型支持图片上传,则上传到图床
+              if (this.canUploadImage) {
+                const formData = new FormData();
+                formData.append('image', file);
+
+                // 创建超时 Promise
+                const timeoutPromise = new Promise((_, reject) => {
+                  setTimeout(
+                    () => reject(new Error('上传超时（15秒）')),
+                    15000
+                  );
+                });
+
+                // 创建上传图床 Promise
+                const uploadPromise = fetch('https://pic.keyi.ma/upload', {
+                  method: 'POST',
+                  body: formData
+                });
+
+                // 使用 Promise.race 实现超时控制
+                const response = await Promise.race([
+                  uploadPromise,
+                  timeoutPromise
+                ]);
+
+                if (!response.ok) {
+                  throw new Error('上传失败: ' + response.statusText);
+                }
+
+                const data = await response.json();
+
+                if (data.success && data.url) {
+                  this.uploadedImages.push({
+                    url: data.url,
+                    file: file
+                  });
+                } else {
+                  throw new Error('上传失败: 返回数据格式错误');
+                }
+              } else {
+                // 不支持图片URL的模型,只保存file对象,发送时再转base64
+                this.uploadedImages.push({
+                  file: file
+                });
+              }
+            } catch (error) {
+              console.error('上传图片失败:', error);
+              this.showSwal({
+                title: '上传失败',
+                text: error.message,
+                icon: 'error',
+                confirmButtonText: '确定'
+              });
+            } finally {
+              this.isUploadingImage = false;
+            }
+          },
+
+          // 处理图片选择
+          async handleImageSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            // 检查文件类型
+            if (!file.type.startsWith('image/')) {
+              this.showSwal({
+                title: '文件类型错误',
+                text: '请选择图片文件',
+                icon: 'error',
+                confirmButtonText: '确定'
+              });
+              event.target.value = '';
+              return;
+            }
+
+            // 检查文件大小 (限制10MB)
+            if (file.size > 10 * 1024 * 1024) {
+              this.showSwal({
+                title: '文件过大',
+                text: '图片大小不能超过10MB',
+                icon: 'error',
+                confirmButtonText: '确定'
+              });
+              event.target.value = '';
+              return;
+            }
+
+            // 上传图片
+            await this.uploadImageFile(file);
+            event.target.value = ''; // 清空input,允许重复选择同一文件
+          },
+
+          // 移除图片
+          removeImage(index) {
+            this.uploadedImages.splice(index, 1);
+          },
+
+          // 清空上传的图片
+          clearUploadedImages() {
+            this.uploadedImages = [];
+          },
+
+          // 预览图片
+          previewImage(imageUrl) {
+            // 如果是INVALID标记,不支持预览
+            if (imageUrl === 'INVALID') return;
+            this.showSwal({
+              imageUrl: imageUrl,
+              imageAlt: '图片预览',
+              showCloseButton: true,
+              showConfirmButton: false,
+              width: 'auto',
+              customClass: {
+                image: 'swal-image-preview'
+              }
+            });
+          },
+
+          // 获取图片的显示URL(用于标签显示)
+          getImageDisplayUrl(img) {
+            if (img.url) {
+              return img.url;
+            } else if (img.file) {
+              return URL.createObjectURL(img.file);
+            }
+            return '';
+          },
+
+          // 将File对象转为base64
+          fileToBase64(file) {
+            return new Promise((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(reader.result);
+              reader.onerror = reject;
+              reader.readAsDataURL(file);
+            });
+          },
+
+          formatTimeStr(time) {
+            let str = new Date(time).toLocaleString();
+            str = str.replace(/:\d{1,2}$/, '');
+            return str;
+          },
+
+          checkMobile() {
+            const isUaMobile = navigator.userAgent
+              .toLowerCase()
+              .includes('mobile');
+            const isSizeMobile = window.innerWidth <= 768;
+            this.isMobile = isUaMobile || isSizeMobile;
+            if (this.isMobile) {
+              document.body.className = 'mobile';
+              this.toggleWideMode(false);
+              return true;
+            } else {
+              document.body.className = 'pc';
+              return false;
+            }
+          },
+
+          toggleSidebar() {
+            if (this.isLoading || this.isStreaming) return;
+            this.showSidebar = !this.showSidebar;
+
+            // 移动端优化：显示侧边栏时添加hash，隐藏时移除hash
+            if (this.isMobile) {
+              if (this.showSidebar) {
+                this.addHash('sidebar');
+                this.sidebarHashAdded = true;
+              } else {
+                if (this.sidebarHashAdded) {
+                  this.removeHash();
+                  this.sidebarHashAdded = false;
+                }
+              }
+            }
+          },
+
+          hideSidebar() {
+            this.showSidebar = false;
+            // 移动端优化：隐藏侧边栏时移除hash
+            if (this.isMobile && this.sidebarHashAdded) {
+              this.removeHash();
+              this.sidebarHashAdded = false;
+            }
+          },
+
+          cancelStreaming() {
+            if (this.abortController) {
+              this.abortController.abort();
+              this.abortController = undefined;
+            }
+            this.isStreaming = false;
+            this.isLoading = false;
+            var session = this.currentSession;
+            // 将流式内容保存为最新的 bot 消息
+            if (this.streamingContent && session && session.messages) {
+              session.messages.push({
+                type: 'bot',
+                content: this.streamingContent,
+                time: new Date().toISOString(),
+                model: this.selectedModel
+              });
+            }
+            this.saveData();
+            this.streamingContent = '';
+          },
+
+          renderMarkdown(text) {
+            if (!text) return '';
+
+            // 使用 marked 解析 Markdown
+            let html = marked.parse(text);
+
+            return html;
+          },
+
+          copyToClipboard(text) {
+            const regexRel = /\[(\d+)\]\(javascript:void\(0\)\)/g;
+            text = text.replace(regexRel, '$1');
+            // 将 <details class="thinking" ... 直至</detail>的内容移除
+            const regexThinking =
+              /<details class="thinking"[\s\S]*?<\/details>/g;
+            text = text.replace(regexThinking, '');
+            text = text.trim();
+            navigator.clipboard
+              .writeText(text)
+              .then(() => {
+                this.showSwal({
+                  title: '复制成功',
+                  text: '内容已复制到剪贴板',
+                  icon: 'success',
+                  timer: 1500,
+                  showConfirmButton: false
+                });
+              })
+              .catch(() => {
+                this.showSwal({
+                  title: '复制失败',
+                  text: '请手动复制内容',
+                  icon: 'error',
+                  confirmButtonText: '确定'
+                });
+              });
+          },
+
+          answerClickHandler(e) {
+            const target = e.target;
+            if (target.tagName !== 'A') return;
+            if (target.href === 'javascript:void(0)') {
+              e.preventDefault();
+            }
+            const blockquote = target.closest('blockquote');
+            const isClickingSearchRes =
+              blockquote && blockquote.innerText.startsWith('联网搜索：');
+            if (!isClickingSearchRes) return;
+            const idx = Array.from(blockquote.querySelectorAll('a')).indexOf(
+              target
+            );
+            const matches = blockquote.innerText.match(
+              new RegExp('「(.*?)」', 'g')
+            );
+            let query = matches && matches[idx];
+            if (!query) return;
+            query = query.replace(/「|」/g, '').trim();
+            this.showSearchRes(query);
+          },
+
+          // 展示搜索结果
+          async showSearchRes(query) {
+            const searchRes = this.getSearchRes(query);
+            if (!searchRes) {
+              this.searchRes = null;
+              return;
+            } else {
+              this.searchRes = searchRes;
+            }
+            await this.$nextTick();
+            const template = this.$refs.searchResTemplate;
+            if (!template) return;
+            const htmlContent = template.innerHTML;
+            // 显示弹窗
+            this.showSwal({
+              title: '联网搜索详情',
+              html: htmlContent,
+              width: this.isMobile ? '95%' : '800px',
+              showConfirmButton: true,
+              confirmButtonText: '&nbsp;关闭&nbsp;',
+              showCancelButton: false,
+              reverseButtons: true,
+              customClass: {
+                popup: 'search-results-popup',
+                htmlContainer: 'search-results-content'
+              }
+            });
+          },
+
+          async shareSession() {
+            const sessionContent = $('.session-content');
+            if (!sessionContent) {
+              this.showSwal({
+                title: '截图失败',
+                text: '未找到要截图的内容',
+                icon: 'error',
+                confirmButtonText: '确定'
+              });
+              return;
+            }
+            this.isCapturing = true;
+            await this.$nextTick();
+
+            // 显示加载提示
+            this.showSwal({
+              title: '正在生成截图...',
+              allowOutsideClick: false,
+              didOpen: () => {
+                Swal.showLoading();
+              }
+            });
+
+            // 使用html2canvas截图
+            html2canvas(sessionContent, {
+              backgroundColor: '#ffffff',
+              scale: window.devicePixelRatio || 1,
+              useCORS: true,
+              allowTaint: false,
+              logging: false,
+              height: null,
+              width: null
+            })
+              .then(canvas => {
+                // 检测是否为微信浏览器环境
+                const userAgent = navigator.userAgent.toLowerCase();
+                const isWechat =
+                  userAgent.includes('micromessenger') &&
+                  userAgent.includes('mobile');
+                const isMobile = this.isMobile;
+                const imageDataUrl = canvas.toDataURL('image/png');
+                this.showSwal({
+                  title: isMobile ? '长按保存图片' : '右键复制图片',
+                  html:
+                    '<div style="max-height: 70vh; overflow-y: auto;"><img src="' +
+                    imageDataUrl +
+                    '" style="max-width: 100%; height: auto; border-radius: 8px;" /></div>',
+                  showConfirmButton: true,
+                  confirmButtonText: '&nbsp;下载&nbsp;',
+                  showCancelButton: true,
+                  cancelButtonText: '&nbsp;关闭&nbsp;',
+                  width: isMobile ? '95%' : 'auto',
+                  padding: '0.25em 0 1em',
+                  customClass: {
+                    htmlContainer: 'swal-image-container'
+                  }
+                }).then(result => {
+                  // 如果点击了确认按钮（显示为"下载"）
+                  if (result.isConfirmed) {
+                    const link = document.createElement('a');
+                    const regex = new RegExp('[\/\: ]', 'g');
+                    link.download =
+                      'openai-chat-' +
+                      new Date().toLocaleString().replace(regex, '-') +
+                      '.png';
+                    link.href = imageDataUrl;
+
+                    // 触发下载
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+
+                    // 显示下载成功提示
+                    this.showSwal({
+                      title: '下载成功',
+                      text: '图片已保存到下载文件夹',
+                      icon: 'success',
+                      timer: 2000,
+                      showConfirmButton: false
+                    });
+                  }
+                });
+              })
+              .catch(error => {
+                console.error('截图失败:', error);
+                this.showSwal({
+                  title: '截图失败',
+                  text: '生成图片时出现错误: ' + error.message,
+                  icon: 'error',
+                  confirmButtonText: '确定'
+                });
+              })
+              .finally(() => {
+                this.isCapturing = false;
+              });
+          },
+
+          updateSessionTitle() {
+            var session = this.currentSession;
+            if (session && session.messages && session.messages.length > 0) {
+              var firstUserMsg = session.messages.find(m => m.type === 'user');
+              if (firstUserMsg && firstUserMsg.content) {
+                var text = firstUserMsg.content;
+                session.title =
+                  text.slice(0, 30) + (text.length > 30 ? '...' : '');
+              }
+            }
+          },
+
+          getModelName(value) {
+            const model = this.availableModels.find(i => i.value === value);
+            if (model) {
+              return model.label;
+            } else {
+              return value;
+            }
+          },
+
+          // 获取消息标签（问题/追问）
+          getMsgLabel(msg, msgIndex) {
+            if (msg.type !== 'user') return '回答';
+            var session = this.currentSession;
+            if (!session || !session.messages) return '问题';
+            // 计算这是第几个用户消息
+            var userMsgIdx = 0;
+            for (var i = 0; i <= msgIndex; i++) {
+              if (session.messages[i].type === 'user') userMsgIdx++;
+            }
+            return userMsgIdx === 1 ? '问题' : '追问';
+          },
+
+          // 判断是否可以编辑该消息
+          canEditMessage(msgIndex) {
+            if (this.isLoading || this.isStreaming) return false;
+            var session = this.currentSession;
+            if (!session || !session.messages) return false;
+            var msg = session.messages[msgIndex];
+            if (msg.type !== 'user') return false;
+            // 只有最后一条用户消息可以编辑
+            for (var i = msgIndex + 1; i < session.messages.length; i++) {
+              if (session.messages[i].type === 'user') return false;
+            }
+            return true;
+          },
+
+          // 判断是否可以重新生成该回答
+          canRegenerateMessage(msgIndex) {
+            if (this.isLoading || this.isStreaming) return false;
+            var session = this.currentSession;
+            if (!session || !session.messages) return false;
+            var msg = session.messages[msgIndex];
+            if (msg.type !== 'bot') return false;
+            // 只有最后一条bot消息可以重新生成
+            return msgIndex === session.messages.length - 1;
+          },
+
+          // 判断是否是最后一条bot消息
+          isLastBotMsg(msgIndex) {
+            var session = this.currentSession;
+            if (!session || !session.messages) return false;
+            var msg = session.messages[msgIndex];
+            if (msg.type !== 'bot') return false;
+            // 检查后面是否还有bot消息
+            for (var i = msgIndex + 1; i < session.messages.length; i++) {
+              if (session.messages[i].type === 'bot') return false;
+            }
+            return true;
+          },
+
+          // 判断是否可以分叉该消息（只有非最新的bot消息可以分叉）
+          canForkMessage(msgIndex) {
+            if (this.isLoading || this.isStreaming) return false;
+            var session = this.currentSession;
+            if (!session || !session.messages) return false;
+            var msg = session.messages[msgIndex];
+            if (msg.type !== 'bot') return false;
+            // 不是最后一条bot消息才可以分叉
+            return !this.isLastBotMsg(msgIndex);
+          },
+
+          // 获取bot消息应该显示的内容（处理流式回答的显示逻辑）
+          getBotMessageContent(msg, msgIndex) {
+            // 如果是最后一条bot消息 且 正在加载/流式传输 且 不是为新消息生成回复
+            // 则显示流式内容，否则显示原消息内容
+            if (
+              this.isLastBotMsg(msgIndex) &&
+              (this.isLoading || this.isStreaming) &&
+              !this.isStreamingNewAnswer
+            ) {
+              return this.streamingContent;
+            }
+            return msg.content;
+          },
+
+          async sendMessage() {
+            if (
+              (!this.messageInput.trim() &&
+                this.uploadedImages.length === 0 &&
+                this.uploadedPlaintexts.length === 0) ||
+              !this.apiKey
+            )
+              return;
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+
+            // 如果已达到最大消息数限制，创建新会话
+            if (this.isMaxMessagesReached) {
+              this.createNewSession();
+              return;
+            }
+
+            this.errorMessage = '';
+            var userMessage = this.messageInput.trim();
+
+            // 处理图片:如果不支持URL,转为base64;否则使用URL
+            var userImages = [];
+            var userImagesForSending = []; // 用于发送API的图片数组
+            for (var imgI = 0; imgI < this.uploadedImages.length; imgI++) {
+              var imgItem = this.uploadedImages[imgI];
+              if (imgItem.url) {
+                // 有URL,使用URL
+                userImages.push(imgItem.url);
+                userImagesForSending.push(imgItem.url);
+              } else if (imgItem.file) {
+                // 没有URL,需要转base64发送,但session中保存INVALID
+                userImages.push('INVALID');
+                var base64 = await this.fileToBase64(imgItem.file);
+                userImagesForSending.push(base64);
+              }
+            }
+
+            // 处理文本附件
+            var userPlaintexts = [];
+            for (var txtI = 0; txtI < this.uploadedPlaintexts.length; txtI++) {
+              userPlaintexts.push({
+                name: this.uploadedPlaintexts[txtI].name,
+                content: this.uploadedPlaintexts[txtI].content
+              });
+            }
+
+            this.clearInput();
+            this.clearUploadedImages(); // 清空上传的图片
+            this.clearUploadedPlaintexts(); // 清空上传的文本文件
+            // 清空当前会话的草稿
+            if (this.currentSession) {
+              this.currentSession.draft = '';
+            }
+
+            // 添加用户消息
+            if (!this.currentSession) {
+              this.createNewSession();
+            }
+            var session = this.currentSession;
+            session.role = this.getRolePrompt();
+
+            // 添加用户消息到messages数组
+            var userMsgObj = {
+              type: 'user',
+              content: userMessage,
+              images: userImages,
+              plaintexts: userPlaintexts,
+              time: new Date().toISOString(),
+              model: this.selectedModel
+            };
+            session.messages.push(userMsgObj);
+
+            // 如果是第一条消息，自动折叠角色设定
+            if (session.messages.length === 1) {
+              this.autoFoldRolePrompt();
+            }
+
+            this.updateSessionTitle();
+            this.saveData();
+            this.scrollToBottom();
+
+            // 发送到 OpenAI API (流式)
+            var apiMessages = [];
+            this.isLoading = true;
+            this.isStreaming = false;
+            this.isSentForAWhile = false;
+            this.sleep(2500).then(() => {
+              this.isSentForAWhile = true;
+            });
+            this.streamingContent = '';
+            this.abortController = new AbortController();
+
+            // 组装messages - OpenAI格式
+            if (this.getRolePrompt()) {
+              var needAssistant = /claude|gpt5/i.test(this.selectedModel);
+              apiMessages.push({
+                role: !needAssistant ? 'system' : 'assistant',
+                content: this.globalRolePrompt.trim()
+              });
+            }
+
+            // 遍历messages数组构建API消息
+            for (var idx = 0; idx < session.messages.length; idx++) {
+              var msg = session.messages[idx];
+              var isLastUserMsg =
+                idx === session.messages.length - 1 && msg.type === 'user';
+
+              if (msg.type === 'user') {
+                var content = [];
+                // 构建文本内容（包含附件）
+                var textContent = msg.content || '';
+                var plaintextsToUse = isLastUserMsg
+                  ? userPlaintexts
+                  : msg.plaintexts || [];
+                if (plaintextsToUse && plaintextsToUse.length > 0) {
+                  textContent += this.buildAttachmentContent(plaintextsToUse);
+                }
+                // 添加文本内容
+                if (textContent && textContent.trim()) {
+                  content.push({
+                    type: 'text',
+                    text: textContent
+                  });
+                }
+                // 添加图片内容
+                var imagesToUse = isLastUserMsg
+                  ? userImagesForSending
+                  : msg.images || [];
+                if (imagesToUse && imagesToUse.length > 0) {
+                  for (var imgIdx = 0; imgIdx < imagesToUse.length; imgIdx++) {
+                    var imageUrl = imagesToUse[imgIdx];
+                    if (imageUrl !== 'INVALID') {
+                      content.push({
+                        type: 'image_url',
+                        image_url: { url: imageUrl }
+                      });
+                    }
+                  }
+                }
+                apiMessages.push({
+                  role: 'user',
+                  content:
+                    content.length === 1 && content[0].type === 'text'
+                      ? content[0].text
+                      : content
+                });
+              } else if (msg.type === 'bot') {
+                apiMessages.push({
+                  role: 'assistant',
+                  content: msg.content
+                });
+              }
+            }
+
+            // 这里根据最新的问句, 调用/search接口查询语料
+            var searchQueries = [];
+            var searchCounts = [];
+            if (this.needSearch) {
+              var queryStr = userMessage;
+              if (session.messages.length > 1) {
+                queryStr +=
+                  '\n\n当前会话摘要："' + (session.summary || '') + '"';
+              }
+              var searchResList = await fetch('/search', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: 'Bearer ' + this.apiKey
+                },
+                body: JSON.stringify({ query: queryStr })
+              })
+                .then(res => res.json())
+                .catch(() => []);
+              var hasResult =
+                searchResList &&
+                searchResList.length &&
+                searchResList.some(
+                  item => item.results && item.results.length > 0
+                ) &&
+                JSON.stringify(searchResList).length > 50;
+              if (hasResult) {
+                searchResList = searchResList.filter(r => {
+                  return r.results && r.results.length > 0;
+                });
+                searchResList.forEach(r => {
+                  this.saveSearchRes(r);
+                });
+                searchResList.forEach(searchRes => {
+                  searchRes.results = searchRes.results.map(item => {
+                    const rest = {};
+                    for (var k in item) {
+                      if (k !== 'url' && k !== 'score' && k !== 'raw_content') {
+                        rest[k] = item[k];
+                      }
+                    }
+                    return rest;
+                  });
+                });
+                searchQueries = searchResList.map(r => r.query);
+                searchCounts = searchResList.map(
+                  r => (r.results && r.results.length) || 0
+                );
+                apiMessages.push({
+                  role: 'assistant',
+                  content:
+                    'AI模型通过实时调用Tavily搜索引擎，找到了以下相关信息: \n\n' +
+                    '<Tavily_Search_Context>' +
+                    JSON.stringify(searchResList) +
+                    '</Tavily_Search_Context>'
+                });
+                apiMessages.push({
+                  role: 'user',
+                  content:
+                    '好的。我强调一下：这不是虚构的未来时间，现在真实世界的时间是： ' +
+                    new Date().toDateString() +
+                    ' ' +
+                    new Date().toTimeString() +
+                    '，请据此推断"最近"、"今年"等时间词的具体含义。\n你无需针对"用户澄清真实时间"这件事做出任何提及和表态，请专注于核心问题的解答。\n\n' +
+                    '## 严格执行原则 (Critical Rules)\n' +
+                    '### 1. 事实基准 (Grounding)\n' +
+                    '*   **优先权**：搜索语料的权重 **高于** 你的内部训练知识。如果搜索结果与你的记忆冲突（特别是时效性信息），**必须**以搜索结果为准。\n' +
+                    '*   **诚实性**：如果搜索结果中没有包含回答问题所需的关键信息，请明确指出"搜索结果未提及此事"，严禁编造数据。\n\n' +
+                    '### 2. "最大化"信息的处理\n' +
+                    '*   你收到的搜索结果可能覆盖了问题的不同维度（定义、新闻、正反观点等）。\n' +
+                    '*   **不要** 简单罗列结果。\n' +
+                    '*   **要** 进行**交叉验证**和**综合叙述**。例如：将Source A的数据与Source B的观点结合起来分析。\n' +
+                    '### 3. 格式要求\n' +
+                    '*   使用 Markdown 格式。\n' +
+                    '*   如果信息量大，**必须**使用层级标题、着重号（Bold）和列表。\n' +
+                    '*   如果涉及对比（如A vs B），尽量使用 Markdown 表格。\n\n' +
+                    '---\n\n' +
+                    '## 回答结构框架\n' +
+                    '1.  **直接解答 (The Bottom Line)**\n' +
+                    '    *   用一句话总结核心答案（TL;DR）。\n' +
+                    '2.  **关键发现 (Key Findings)**\n' +
+                    '    *   分点详述，整合不同维度的信息。\n' +
+                    '3.  **深度解析 (Deep Dive)** (视情况而定)\n' +
+                    '    *   解释背后的原因、背景或具体数据支撑。\n' +
+                    '4.  **来源列表 (References)**\n' +
+                    '    *   列出你实际引用的参考链接(应当是包含真实url、可通过点击跳转的Markdown超链接，例如：1. [](https://en.wikipedia.org/wiki/DeepSeek) )。\n\n' +
+                    '---\n\n' +
+                    '## 用户问题 (User Question)\n' +
+                    '<User_Question>\n' +
+                    queryStr +
+                    '\n' +
+                    '</User_Question>\n\n' +
+                    '现在你的任务是基于上述提供的**实时搜索结果**（Tavily_Search_Context），回答用户的原始问题。你需要像撰写深度调查报告一样，将碎片化的信息拼凑成完整的逻辑链条。'
+                });
+                // 显示搜索结果数量（如果有）
+                if (searchQueries.length && !this.streamingContent) {
+                  this.streamingContent =
+                    '> 联网搜索：' +
+                    searchQueries.map(q => '「' + q + '」').join('、') +
+                    '\n> \n> AI 模型通过实时调用 Tavily 搜索引擎，找到了 ' +
+                    searchCounts
+                      .map(c => '[' + c + '](javascript:void(0))')
+                      .join(' + ') +
+                    ' 条相关信息。\n\n';
+                }
+              }
+            }
+
+            try {
+              // 如果上一步search中途已经被用户主动中止,则不再继续
+              if (this.abortController === undefined) return;
+
+              var url = '/v1/chat/completions';
+              var response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: 'Bearer ' + this.apiKey
+                },
+                body: JSON.stringify({
+                  model: this.selectedModel,
+                  messages: apiMessages,
+                  temperature: 1,
+                  stream: true
+                }),
+                signal: this.abortController.signal
+              }).catch(e => {
+                throw e;
+              });
+
+              if (!response.ok) {
+                var errorData = await response.json().catch(() => ({}));
+                var errorMessage =
+                  (errorData.error && errorData.error.message) ||
+                  errorData.error;
+                var errMsg =
+                  errorMessage ||
+                  'HTTP ' + response.status + ': ' + response.statusText;
+                throw new Error(errMsg);
+              }
+
+              // 开始流式读取
+              this.isLoading = false;
+              this.isStreaming = true;
+
+              var reader = response.body.getReader();
+              var decoder = new TextDecoder();
+              var buffer = '';
+              var isInThinking = false; // 标记是否处于思考模式
+
+              while (true) {
+                var readResult = await reader.read();
+                if (readResult.done) break;
+
+                buffer += decoder.decode(readResult.value, { stream: true });
+
+                var lines = buffer.split('\n');
+                buffer = lines.pop() || ''; // 保留最后一个不完整的行
+
+                for (var lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+                  var lineItem = lines[lineIdx];
+                  var trimmedLine = lineItem.trim();
+                  if (!trimmedLine || trimmedLine === 'data: [DONE]') continue;
+
+                  if (trimmedLine.startsWith('data:')) {
+                    try {
+                      // 移除 'data:' 前缀（注意可能没有空格）
+                      var jsonStr = trimmedLine.startsWith('data: ')
+                        ? trimmedLine.slice(6)
+                        : trimmedLine.slice(5);
+                      var data = JSON.parse(jsonStr);
+
+                      // 处理 reasoning_content (思考内容)
+                      if (
+                        data.choices &&
+                        data.choices[0].delta.reasoning_content
+                      ) {
+                        var reasoningDelta =
+                          data.choices[0].delta.reasoning_content;
+                        if (reasoningDelta) {
+                          var shouldScroll = !this.streamingContent;
+                          // 如果还未进入思考模式，添加开始标签
+                          if (!isInThinking) {
+                            this.streamingContent +=
+                              '<details class="thinking" open style="position: relative; overflow: hidden; font-size: 0.75em">\n<summary>思考内容</summary>\n\n';
+                            isInThinking = true;
+                          }
+                          this.streamingContent += reasoningDelta;
+                          if (shouldScroll) {
+                            this.scrollToBottom();
+                          }
+                        }
+                      }
+
+                      // 处理 content (正式回答)
+                      if (data.choices && data.choices[0].delta.content) {
+                        var delta = data.choices[0].delta.content;
+                        // 如果之前在思考模式，现在要输出正式内容了，先关闭思考块
+                        if (isInThinking) {
+                          this.streamingContent += '\n</details>\n\n';
+                          this.streamingContent = this.streamingContent.replace(
+                            '<details class="thinking" open',
+                            '<details class="thinking"'
+                          );
+                          isInThinking = false;
+                        }
+                        var regThinkStart = new RegExp('<think>');
+                        var regThinkEnd = new RegExp('</think>');
+                        var shouldFoldThinking = false;
+                        delta = delta.replace(
+                          regThinkStart,
+                          '<details class="thinking" open style="position: relative; overflow: hidden; font-size: 0.75em">\n<summary>思考内容</summary>\n\n'
+                        );
+                        if (regThinkEnd.test(delta)) {
+                          delta = delta.replace(regThinkEnd, '</details>\n');
+                          shouldFoldThinking = true;
+                        }
+
+                        if (delta) {
+                          var shouldScroll = !this.streamingContent;
+                          var content = delta;
+                          if (shouldFoldThinking) {
+                            content = content.replace(
+                              '<details class="thinking" open',
+                              '<details class="thinking"'
+                            );
+                          }
+                          this.streamingContent += content;
+                          if (shouldScroll) {
+                            this.scrollToBottom();
+                          }
+                        }
+                      }
+                    } catch (parseError) {
+                      console.warn(
+                        '解析 SSE 数据失败:',
+                        parseError,
+                        'Line:',
+                        trimmedLine
+                      );
+                    }
+                  }
+                }
+              }
+
+              // 流式完成，将内容保存到消息数组中
+              session.messages.push({
+                type: 'bot',
+                content: this.streamingContent,
+                time: new Date().toISOString(),
+                model: this.selectedModel
+              });
+              this.saveData();
+            } catch (error) {
+              console.error('Error:', error);
+              if (error.name === 'AbortError') {
+                this.errorMessage = '请求已取消';
+              } else {
+                this.errorMessage = '发送失败: ' + error.message;
+                // 显示错误提示
+                this.showSwal({
+                  title: '发送失败',
+                  text: error.message,
+                  icon: 'error',
+                  confirmButtonText: '确定'
+                });
+              }
+              // 如果有流式内容，仍然保存到消息数组
+              if (this.streamingContent) {
+                session.messages.push({
+                  type: 'bot',
+                  content: this.streamingContent,
+                  time: new Date().toISOString(),
+                  model: this.selectedModel
+                });
+                this.saveData();
+              }
+            } finally {
+              this.isLoading = false;
+              this.isStreaming = false;
+              this.streamingContent = '';
+              this.abortController = null;
+              this.generateSessionSummary();
+              // this.scrollToBottom();
+            }
+          },
+          // 保存tavily的搜索结果,用于后续回显
+          saveSearchRes(res) {
+            const KEY = 'openai_search_results';
+            const query = res && res.query;
+            if (!query) return;
+            if (!res.results || res.results.length === 0) return;
+            let cache = localStorage.getItem(KEY);
+            if (cache) {
+              try {
+                cache = JSON.parse(cache);
+              } catch (e) {
+                cache = [];
+              }
+            } else {
+              cache = [];
+            }
+            const idx = cache.findIndex(i => i.query === query);
+            if (idx >= 0) {
+              cache.splice(idx, 1, res);
+            } else {
+              cache.unshift(res);
+              cache = cache.slice(0, 30);
+            }
+            localStorage.setItem(KEY, JSON.stringify(cache));
+          },
+
+          // 根据query找到cache中缓存的搜索结果
+          getSearchRes(query) {
+            if (!query) return null;
+            const KEY = 'openai_search_results';
+            let cache = localStorage.getItem(KEY);
+            if (cache) {
+              try {
+                cache = JSON.parse(cache);
+              } catch (e) {
+                cache = [];
+              }
+            } else {
+              cache = [];
+            }
+            const res = cache.find(i => i.query === query);
+            return res || null;
+          },
+
+          // 编辑已经问过的问题
+          editQuestion(msgIndex) {
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+            if (!this.currentSession) return;
+            var session = this.currentSession;
+            var msg = session.messages[msgIndex];
+            if (!msg || msg.type !== 'user') return;
+
+            // 二次确认
+            this.showSwal({
+              title: '确认编辑问题',
+              text: '这会删除该问题及之后的所有对话，您确定要编辑这个问题吗？',
+              icon: 'warning',
+              showCancelButton: true,
+              confirmButtonText: '确定',
+              confirmButtonColor: '#d33',
+              cancelButtonText: '取消',
+              reverseButtons: true
+            }).then(result => {
+              if (!result.isConfirmed) return;
+              var questionText = msg.content || '';
+              // 恢复图片到上传列表
+              this.uploadedImages = (msg.images || [])
+                .filter(i => i && i !== 'INVALID')
+                .map(i => ({ url: i }));
+              // 恢复文本附件到上传列表
+              this.uploadedPlaintexts = (msg.plaintexts || []).map(item => {
+                return { name: item.name, content: item.content };
+              });
+              // 删除从 msgIndex 开始的所有消息
+              session.messages = session.messages.slice(0, msgIndex);
+              // 如果删除了所有消息，重置标题和摘要
+              if (session.messages.length === 0) {
+                session.title = '新会话';
+                session.summary = '';
+              }
+              session.draft = questionText;
+              this.messageInput = questionText;
+              session.role = this.getRolePrompt();
+              this.saveData();
+            });
+          },
+
+          // 删除最新的回答并重新回答
+          regenerateAnswer(msgIndex) {
+            // 二次确认
+            this.showSwal({
+              title: '确认删除回答',
+              text: '确定要删除这个回答并重新生成吗？',
+              icon: 'warning',
+              showCancelButton: true,
+              confirmButtonText: '确定',
+              confirmButtonColor: '#d33',
+              cancelButtonText: '取消',
+              reverseButtons: true
+            }).then(result => {
+              if (!result.isConfirmed) return;
+              if (this.isLoading || this.isStreaming || this.isUploadingImage)
+                return;
+              var session = this.currentSession;
+              if (
+                !session ||
+                !session.messages ||
+                session.messages.length === 0
+              )
+                return;
+
+              var msg = session.messages[msgIndex];
+              if (!msg || msg.type !== 'bot') return;
+
+              // 删除这个回答（保留之前的用户问题）
+              session.messages = session.messages.slice(0, msgIndex);
+              this.saveData();
+
+              // 重新发送消息
+              this.retryCurrentQuestion();
+            });
+          },
+
+          // 从指定消息分叉创建新会话
+          forkFromMessage(msgIndex) {
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+            var session = this.currentSession;
+            if (!session || !session.messages) return;
+            var msg = session.messages[msgIndex];
+            if (!msg || msg.type !== 'bot') return;
+
+            // 二次确认
+            this.showSwal({
+              title: '确认分叉会话',
+              text: '将从此消息往前的所有对话创建为新会话，是否继续？',
+              icon: 'question',
+              showCancelButton: true,
+              confirmButtonText: '确定',
+              confirmButtonColor: '#3085d6',
+              cancelButtonText: '取消',
+              reverseButtons: true
+            }).then(result => {
+              if (!result.isConfirmed) return;
+
+              // 截取从开始到 msgIndex 的所有消息
+              var forkedMessages = session.messages.slice(0, msgIndex + 1);
+
+              // 创建新会话
+              var newSession = {
+                id: Date.now().toString(),
+                title: '🔀 ' + (session.title || '新会话'),
+                summary: session.summary ? '🔀 ' + session.summary : '',
+                role: session.role || '',
+                draft: '',
+                messages: forkedMessages
+              };
+
+              // 添加到会话列表
+              this.sessions.unshift(newSession);
+              // 切换到新会话
+              this.currentSessionId = newSession.id;
+              // 加载新会话的草稿
+              this.loadDraftFromCurrentSession();
+              this.saveData();
+
+              // 移动端创建新会话后隐藏侧边栏
+              if (this.isMobile) {
+                this.hideSidebar();
+              }
+
+              // 提示用户
+              this.showSwal({
+                title: '分叉成功',
+                text: '已创建新会话，包含 ' + forkedMessages.length + ' 条消息',
+                icon: 'success',
+                timer: 2000,
+                showConfirmButton: false
+              });
+            });
+          },
+
+          // 重新发送当前问题（用于API错误后的重试）
+          retryCurrentQuestion() {
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+            var session = this.currentSession;
+            if (!session || !session.messages) return;
+
+            // 清除错误消息
+            this.errorMessage = '';
+
+            // 找到最后一条用户消息
+            var lastUserMsgIdx = -1;
+            for (var i = session.messages.length - 1; i >= 0; i--) {
+              if (session.messages[i].type === 'user') {
+                lastUserMsgIdx = i;
+                break;
+              }
+            }
+
+            if (lastUserMsgIdx === -1) return;
+
+            var lastUserMsg = session.messages[lastUserMsgIdx];
+            // 检查这条用户消息后面是否已经有回答
+            var hasAnswer =
+              session.messages.length > lastUserMsgIdx + 1 &&
+              session.messages[lastUserMsgIdx + 1].type === 'bot';
+
+            if (!hasAnswer) {
+              // 没有回答，需要重试：删除这条用户消息并重新发送
+              this.messageInput = lastUserMsg.content || '';
+              this.uploadedImages = (lastUserMsg.images || [])
+                .filter(i => i && i !== 'INVALID')
+                .map(i => ({ url: i }));
+              // 恢复文本附件到上传列表
+              this.uploadedPlaintexts = (lastUserMsg.plaintexts || []).map(
+                item => {
+                  return { name: item.name, content: item.content };
+                }
+              );
+              // 删除最后一条用户消息
+              session.messages = session.messages.slice(0, lastUserMsgIdx);
+              this.sendMessage();
+            }
+          },
+
+          // 生成会话摘要
+          async generateSessionSummary() {
+            var session = this.currentSession;
+            if (!session || !session.messages || session.messages.length < 2)
+              return;
+            // 已有摘要且消息数超过2条时不再生成
+            if (session.summary && session.messages.length > 2) return;
+
+            // 获取第一条用户消息和第一条bot回复
+            var firstUserMsg = null;
+            var firstBotMsg = null;
+            for (var i = 0; i < session.messages.length; i++) {
+              if (!firstUserMsg && session.messages[i].type === 'user') {
+                firstUserMsg = session.messages[i];
+              } else if (!firstBotMsg && session.messages[i].type === 'bot') {
+                firstBotMsg = session.messages[i];
+              }
+              if (firstUserMsg && firstBotMsg) break;
+            }
+
+            if (!firstUserMsg || !firstBotMsg) return;
+
+            var sessionId = session.id;
+            var question = firstUserMsg.content;
+            var answer = firstBotMsg.content;
+
+            await this.sleep(150);
+
+            fetch('/summarize', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: 'Bearer ' + this.apiKey
+              },
+              body: JSON.stringify({
+                question: question,
+                answer: answer
+              })
+            })
+              .then(response => {
+                if (!response.ok) {
+                  throw new Error(
+                    'HTTP ' + response.status + ': ' + response.statusText
+                  );
+                }
+                return response.json();
+              })
+              .then(data => {
+                if (data.success && data.summary) {
+                  var summary = data.summary.trim();
+                  var item = this.sessions.find(s => s.id === sessionId);
+                  if (item) {
+                    // 移除结尾的标点符号
+                    if (
+                      summary.endsWith('。') ||
+                      summary.endsWith('！') ||
+                      summary.endsWith('？')
+                    ) {
+                      summary = summary.slice(0, -1);
+                    }
+                    item.summary = summary;
+                    this.sleep(1000).then(() => {
+                      this.saveData();
+                    });
+                  }
+                } else {
+                  throw new Error('未能生成摘要');
+                }
+              })
+              .catch(error => {
+                console.error('生成摘要失败:', error);
+              });
+          },
+
+          // 根据全局角色设定的字符长度决定是否折叠
+          autoFoldRolePrompt() {
+            const len = (
+              (this.currentSession && this.currentSession.role) ||
+              ''
+            ).length;
+            if (len > 150) {
+              this.isFoldRole = true;
+            } else {
+              this.isFoldRole = false;
+            }
+          },
+
+          handleKeyDown(event) {
+            if (this.isPC && event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault();
+              this.sendMessage();
+            }
+          },
+
+          autoResizeTextarea() {
+            this.$nextTick(() => {
+              const textarea = this.$refs.messageInputRef;
+              if (textarea) {
+                textarea.style.height = 'auto';
+                textarea.style.height =
+                  Math.min(textarea.scrollHeight, 144) + 'px';
+              }
+            });
+          },
+
+          scrollToTop() {
+            this.$nextTick(() => {
+              const container = this.$refs.messagesContainer;
+              if (container) {
+                container.scrollTop = 0;
+              }
+            });
+          },
+
+          scrollToBottom() {
+            this.$nextTick(() => {
+              const container = this.$refs.messagesContainer;
+              if (container) {
+                container.scrollTop = container.scrollHeight;
+              }
+            });
+          },
+
+          // 如果当前已经滑动到底部，则保持在底部
+          async stickToBottom() {
+            await this.$nextTick();
+            const vh = window.innerHeight;
+            const container = this.$refs.messagesContainer;
+            if (!container) return;
+            // 如果当前容器滚动高度低于1.15倍window.innerHeight, 强制滚动到底部
+            if (container.scrollHeight < vh * 1.15) {
+              container.scrollTop = container.scrollHeight;
+              return;
+            }
+            const isAtBottom =
+              container.scrollHeight - container.scrollTop <=
+              container.clientHeight + vh * 0.2;
+            if (isAtBottom) {
+              container.scrollTop = container.scrollHeight;
+            }
+          },
+
+          // 清空输入框
+          clearInput() {
+            this.messageInput = '';
+            this.saveDraftToCurrentSession();
+          },
+
+          // 输入变化时的处理
+          onInputChange() {
+            this.saveDraftToCurrentSession();
+          },
+
+          // 保存草稿到当前会话
+          saveDraftToCurrentSession() {
+            if (this.currentSession) {
+              this.currentSession.draft = this.messageInput;
+              this.saveData();
+            }
+          },
+
+          // 从当前会话加载草稿
+          loadDraftFromCurrentSession() {
+            if (this.currentSession) {
+              this.messageInput = (this.currentSession.draft || '').trim();
+            } else {
+              this.messageInput = '';
+            }
+          },
+
+          // 显示关于信息
+          showAbout() {
+            const isMobile = this.isMobile;
+            const template = this.$refs.aboutTemplate;
+            if (!template) return;
+            const htmlContent = template.innerHTML;
+            this.showSwal({
+              title: '关于 OpenAI WebUI Lite',
+              confirmButtonText: '&emsp;知道了&emsp;',
+              width: isMobile ? '95%' : '600px',
+              html: htmlContent
+            });
+          }
+        }
+      }).mount('#app');
+    </script>
+  </body>
+</html>
